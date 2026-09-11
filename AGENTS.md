@@ -35,11 +35,12 @@ The client (`happy-tourist.github.io`) already assumes:
 
 | Client expectation | Server today |
 |--------------------|--------------|
-| Room type name `checkers` | Registered as `my_room` in `app.config.ts` |
+| Room type name `checkers` | Registered as `checkers` in `app.config.ts` with `.enableRealtimeListing()` |
+| Live lobby (`LobbyRoom`) | `lobby: defineRoom(LobbyRoom)` — client filters `name: checkers` |
 | State: `board`, `currentTurn`, `status`, `players[sessionId].color` | Scaffold `MyRoomState` with `mySynchronizedProperty` |
 | Message `move` `{ from, to }` | Not implemented yet |
 | Cell values `0`–`4` (empty / white / black / kings) | Not implemented yet |
-| Lobby `GET /rooms/checkers` | Will work once the room is registered as `checkers` (Colyseus built-in listing) |
+| Lobby `GET /rooms/checkers` | Available (HTTP listing); UI uses live LobbyRoom instead |
 
 When implementing checkers, prefer aligning room name, schema, and messages with the client rather than changing the client unilaterally.
 
@@ -67,7 +68,7 @@ Application entry: `src/index.ts` → `listen(app)` from `@colyseus/tools`. Pref
 2. `src/index.ts` imports `app.config.ts` and calls `listen(app)` (port `PORT` or `2567`).
 3. `defineServer` wires:
    - `database: db` — enables `@colyseus/auth` HTTP routes + user store;
-   - `rooms` — currently `my_room` → `MyRoom`;
+   - `rooms` — `lobby` → `LobbyRoom`; `checkers` → `MyRoom.enableRealtimeListing()`;
    - `routes` — custom HTTP endpoints (`/api/hello`);
    - `express(app)` — CORS, `/health`, `/hi`, and (non-prod) `/monitor` + playground.
 
@@ -89,10 +90,11 @@ See `.env.example`:
 - Room gate: `MyRoom.onAuth` verifies JWT and returns userdata to `onJoin`.
 
 ## Rooms
-- `src/rooms/MyRoom.ts` — scaffold room: `onCreate` / `onJoin` / `onLeave` / `onDispose` stubs; comments describe intended checkers flow (`maxClients = 2`, seat colors, disconnect handling).
+- `src/app.config.ts` — `lobby` (built-in `LobbyRoom`) + `checkers` (`MyRoom` + `.enableRealtimeListing()`) for live lobby list.
+- `src/rooms/MyRoom.ts` — scaffold room: `onCreate` (minimal `setMetadata` for list) / `onJoin` / `onLeave` / `onDispose` stubs; comments describe intended checkers flow (`maxClients = 2`, seat colors, disconnect handling).
 - `src/rooms/schema/MyRoomState.ts` — scaffold synced state (`mySynchronizedProperty`).
 
-Intended product room (align with client): name `checkers`, state board/turn/status/players, handle `move`.
+Product room name is `checkers`; fill state board/turn/status/players and `move` to match client.
 
 ## HTTP Surface
 From `src/app.config.ts` and Colyseus auth:
@@ -103,7 +105,7 @@ From `src/app.config.ts` and Colyseus auth:
 | GET | `/hi` | Plain text smoke check |
 | GET | `/api/hello` | Demo JSON via `createEndpoint` |
 | * | `/auth/*` | Provided by `@colyseus/auth` when `database` is set |
-| GET | `/rooms/:roomName` | Colyseus available-rooms listing (client lobby) |
+| GET | `/rooms/:roomName` | Colyseus available-rooms listing (HTTP fallback; live UI uses LobbyRoom) |
 | GET | `/monitor` | Dev only (`monitor()`) |
 | * | `/` playground | Dev only (`playground()`) |
 
@@ -128,14 +130,14 @@ Outside `src`:
 Typical paths:
 
 - HTTP auth → `@colyseus/auth` + `GameDatabase` / `users` schema.
-- Matchmaking → Colyseus room create/join + `/rooms/:roomName`.
+- Matchmaking → Colyseus `lobby` + `checkers` realtime listing; HTTP `/rooms/:roomName` remains.
 - Gameplay → `Room` handler + schema state → client `onStateChange` / `send('move')`.
 
 Keep rules authoritative in the room; do not trust client board state. Prefer extending `users` schema defaults carefully so register/login stay compatible.
 
 ## Tests And Loadtest
-- `test/MyRoom.test.ts` — boots `appConfig`, signs JWT, creates `my_room`, connects client, asserts `sessionId`.
-- `loadtest/example.ts` — `joinOrCreate` scaffold; pass `--room` / `--numClients` via npm script.
+- `test/MyRoom.test.ts` — boots `appConfig`, signs JWT, creates `checkers`, connects client; includes lobby live-list cases (SC-LOBBY-02/03).
+- `loadtest/example.ts` — `joinOrCreate` scaffold; `--room checkers` / `--numClients` via npm script.
 
 Update tests when the registered room name or auth contract changes.
 
@@ -162,7 +164,7 @@ There are **no** local `.agents/skills/` in this package. Runtime paths in skill
 
 Typical Cursor chat workflow: `/opsx-explore` → `/opsx-propose` → artifact review → `/opsx-apply` → `/opsx-sync` → `/opsx-archive`. OpenSpec artifacts are created and archived in **happy-tourist-meta**, not in this repo.
 
-Commands (`npm test`, `npm run build`, `npm run dev`, `npm run loadtest`) are run by the **user** from this package; the agent proposes and waits for «готово».
+Commands (`npm test`, `npm run build`, `npm run dev`, `npm run loadtest`) are run by the **agent** from this package root. Do not wait for user confirmation; fix failures before claiming done.
 
 ## Related Package
 - [`../happy-tourist.github.io`](../happy-tourist.github.io) — Vue 3 + Quasar SPA (GitHub Pages). Prefer changing room names, state schema, and move protocol in coordination with the client; the client assumes room type `checkers` and the board/turn/status/players shape described in its `AGENTS.md`.

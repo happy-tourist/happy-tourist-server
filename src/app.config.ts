@@ -1,6 +1,7 @@
 import {
   defineServer,
   defineRoom,
+  LobbyRoom,
   monitor,
   playground,
   createRouter,
@@ -24,7 +25,8 @@ const server = defineServer({
   database: db,
 
   rooms: {
-    my_room: defineRoom(MyRoom),
+    lobby: defineRoom(LobbyRoom),
+    checkers: defineRoom(MyRoom).enableRealtimeListing(),
   },
 
   routes: createRouter({

@@ -19,6 +19,8 @@ export class MyRoom extends Room {
 
   onCreate(_options: any) {
     console.log("[MyRoom] комната создана");
+    // Минимальные поля для live lobby list (LobbyPage: metadata.title / status).
+    this.setMetadata({ title: "Checkers", status: "waiting" });
     // Здесь: инициализация состояния доски, установка maxClients = 2 и т.д.
   }
 
