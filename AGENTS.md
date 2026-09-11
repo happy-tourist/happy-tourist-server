@@ -69,7 +69,7 @@ Application entry: `src/index.ts` → `listen(app)` from `@colyseus/tools`. Pref
 3. `defineServer` wires:
    - `database: db` — enables `@colyseus/auth` HTTP routes + user store;
    - `rooms` — `lobby` → `LobbyRoom`; `checkers` → `MyRoom.enableRealtimeListing()`;
-   - `routes` — custom HTTP endpoints (`/api/hello`, `POST /api/theme`);
+   - `routes` — custom HTTP endpoints (`/api/hello`, `GET|POST /api/theme`);
    - `express(app)` — CORS, `/health`, `/hi`, and (non-prod) `/monitor` + playground.
 
 ## Config And Env
@@ -106,6 +106,7 @@ From `src/app.config.ts` and Colyseus auth:
 | GET | `/health` | `{ status, uptime }` — deploy/monitor |
 | GET | `/hi` | Plain text smoke check |
 | GET | `/api/hello` | Demo JSON via `createEndpoint` |
+| GET | `/api/theme` | `{ theme: 'light' \| 'dark' \| null }`; JWT + registered only; SELECT `users.theme` |
 | POST | `/api/theme` | `{ theme: 'light' \| 'dark' }`; JWT + registered only; updates `users.theme` |
 | * | `/auth/*` | Provided by `@colyseus/auth` when `database` is set |
 | GET | `/rooms/:roomName` | Colyseus available-rooms listing (HTTP fallback; live UI uses LobbyRoom) |
@@ -140,7 +141,7 @@ Keep rules authoritative in the room; do not trust client board state. Prefer ex
 
 ## Tests And Loadtest
 - `test/MyRoom.test.ts` — boots `appConfig`, signs JWT, creates `checkers`, connects client; includes lobby live-list cases (SC-LOBBY-02/03).
-- `test/theme.test.ts` — `POST /api/theme`: unauthenticated/anonymous reject; registered persist + login userdata.
+- `test/theme.test.ts` — `POST /api/theme`: unauthenticated/anonymous reject; registered persist + login userdata; `GET /api/theme` after POST with same JWT (SC-THEME-08) and with older session JWT after another device saves (SC-THEME-09).
 - `loadtest/example.ts` — `joinOrCreate` scaffold; `--room checkers` / `--numClients` via npm script.
 
 Update tests when the registered room name, auth contract, or preference HTTP changes.

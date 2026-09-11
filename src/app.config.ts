@@ -46,6 +46,36 @@ const server = defineServer({
     }),
 
     /**
+     * Read registered-user UI theme from profile (SC-THEME-08 / SC-THEME-09).
+     * Guest/anonymous and unauthenticated callers are rejected (same as POST).
+     */
+    api_theme_get: createEndpoint(
+      "/api/theme",
+      {
+        method: "GET",
+        use: [auth.middleware()],
+      },
+      async (ctx) => {
+        const authUser = ctx.context.auth as {
+          id?: string;
+          anonymous?: boolean;
+        };
+
+        if (!authUser?.id || authUser.anonymous === true) {
+          throw new APIError(403, { error: "registered_user_required" });
+        }
+
+        const rows = await db.drizzle
+          .select({ theme: users.theme })
+          .from(users)
+          .where(eq(users.id, authUser.id))
+          .limit(1);
+
+        return { theme: rows[0]?.theme ?? null };
+      }
+    ),
+
+    /**
      * Persist registered-user UI theme preference (SC-THEME-04 / SC-THEME-05).
      * Guest/anonymous and unauthenticated callers are rejected.
      */
