@@ -10,6 +10,8 @@ import {
 
 import { db } from "./db/index.js";
 import { MyRoom } from "./rooms/MyRoom.js";
+// Side-effect: register OAuth providers (google) before listen
+import "./config/auth.js";
 
 const ALLOWED_ORIGIN =
   process.env.NODE_ENV === "production"

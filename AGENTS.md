@@ -3,14 +3,14 @@ Before work: local [`project-map.md`](project-map.md) (key `happy-tourist-meta` 
 Skills and OpenSpec live in **happy-tourist-meta**, not in this package. Before choosing a skill: [`happy-tourist-meta/.agents/skills/server/`](../happy-tourist-meta/.agents/skills/server/) (see [`happy-tourist-meta/.agents/AGENTS.md`](../happy-tourist-meta/.agents/AGENTS.md)).
 
 ## What This Application Is
-`happy-tourist-server` is the Colyseus multiplayer backend for online checkers (шашки). It authenticates players (email/password and anonymous via `@colyseus/auth`), hosts realtime game rooms, syncs board state to clients, and exposes a small HTTP surface (health, demo API, auth routes from Colyseus).
+`happy-tourist-server` is the Colyseus multiplayer backend for online checkers (шашки). It authenticates players (email/password, anonymous, and Google OAuth via `@colyseus/auth` `addProvider('google')` in `src/config/auth.ts`), hosts realtime game rooms, syncs board state to clients, and exposes a small HTTP surface (health, demo API, auth routes from Colyseus).
 
 This repository is the server-only package. The sibling browser SPA lives in [`../happy-tourist.github.io`](../happy-tourist.github.io) and connects via WebSocket / HTTP (`VITE_COLYSEUS_URL` / `VITE_API_URL` on the client).
 
 ## What It Is Used For
 Main scenarios (target product; room logic is still a scaffold — see **Current vs client contract**):
 
-- Register / login / anonymous auth (`@colyseus/auth` + SQLite user store).
+- Register / login / anonymous / Google OAuth auth (`@colyseus/auth` + SQLite user store; callback `…/auth/provider/google/callback`).
 - Create / join checkers rooms; list available rooms for the lobby.
 - Host a 1v1 russian checkers match with authoritative board state and `move` messages.
 - Persist basic player profile fields (display name, rating, games played/won) on the auth user table.
