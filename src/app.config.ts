@@ -15,6 +15,8 @@ const ALLOWED_ORIGIN =
     ? "https://happy-tourist.github.io"
     : true; // в dev разрешаем любой origin
 
+console.log("[happy-tourist] deploy test — version 1");
+
 const server = defineServer({
   /**
    * Передаём database — этого достаточно, чтобы @colyseus/auth
