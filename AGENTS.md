@@ -69,7 +69,7 @@ Application entry: `src/index.ts` → `listen(app)` from `@colyseus/tools`. Pref
 3. `defineServer` wires:
    - `database: db` — enables `@colyseus/auth` HTTP routes + user store;
    - `rooms` — `lobby` → `LobbyRoom`; `checkers` → `MyRoom.enableRealtimeListing()`;
-   - `routes` — custom HTTP endpoints (`/api/hello`);
+   - `routes` — custom HTTP endpoints (`/api/hello`, `POST /api/theme`);
    - `express(app)` — CORS, `/health`, `/hi`, and (non-prod) `/monitor` + playground.
 
 ## Config And Env
@@ -88,7 +88,7 @@ See `.env.example`:
 ## Auth And Database
 - `src/config/auth.ts` — `auth.oauth.addProvider('google', …)` (side-effect import from `app.config.ts`); leave built-in `onOAuthProviderCallback` alone.
 - `src/db/index.ts` — `GameDatabase` with `schemas: { users }`.
-- `src/db/schema.ts` — extends built-in `colyseus_users` with `displayName`, `rating` (default 1000), `gamesPlayed`, `gamesWon` (defaults 0). Custom columns need `.default(...)` so built-in `/auth/register` / `/auth/login` do not fail on NOT NULL.
+- `src/db/schema.ts` — extends built-in `colyseus_users` with `displayName`, `rating` (default 1000), `gamesPlayed`, `gamesWon` (defaults 0), and nullable `theme` (`light` \| `dark` \| unset). Custom **NOT NULL** columns need `.default(...)` so built-in `/auth/register` / `/auth/login` do not fail; nullable prefs like `theme` do not.
 - Room gate: `MyRoom.onAuth` verifies JWT and returns userdata to `onJoin` (same for email / anonymous / Google JWT).
 
 ## Rooms
@@ -106,6 +106,7 @@ From `src/app.config.ts` and Colyseus auth:
 | GET | `/health` | `{ status, uptime }` — deploy/monitor |
 | GET | `/hi` | Plain text smoke check |
 | GET | `/api/hello` | Demo JSON via `createEndpoint` |
+| POST | `/api/theme` | `{ theme: 'light' \| 'dark' }`; JWT + registered only; updates `users.theme` |
 | * | `/auth/*` | Provided by `@colyseus/auth` when `database` is set |
 | GET | `/rooms/:roomName` | Colyseus available-rooms listing (HTTP fallback; live UI uses LobbyRoom) |
 | GET | `/monitor` | Dev only (`monitor()`) |
@@ -139,9 +140,10 @@ Keep rules authoritative in the room; do not trust client board state. Prefer ex
 
 ## Tests And Loadtest
 - `test/MyRoom.test.ts` — boots `appConfig`, signs JWT, creates `checkers`, connects client; includes lobby live-list cases (SC-LOBBY-02/03).
+- `test/theme.test.ts` — `POST /api/theme`: unauthenticated/anonymous reject; registered persist + login userdata.
 - `loadtest/example.ts` — `joinOrCreate` scaffold; `--room checkers` / `--numClients` via npm script.
 
-Update tests when the registered room name or auth contract changes.
+Update tests when the registered room name, auth contract, or preference HTTP changes.
 
 ## Deploy
 - CI: push to `main` → compile locally in Actions → rsync (excludes `.git`, `node_modules`, `build`, `.env*`, `game.db*`) → remote `npm ci`, `npm run build`, `pm2 reload`.
