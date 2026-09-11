@@ -22,15 +22,15 @@ module.exports = {
       kill_timeout: 5000,
 
       // Мягкий лимит RSS: PM2 перезапустит процесс при превышении
-      max_memory_restart: "400M",
+      max_memory_restart: "500M",
 
       // Жёсткий лимит heap V8
-      node_args: "--max-old-space-size=256",
+      node_args: "--max-old-space-size=350",
 
       env: {
         NODE_ENV: "production",
         PORT: 2567,
-        NODE_OPTIONS: "--max-old-space-size=256",
+        NODE_OPTIONS: "--max-old-space-size=350",
       },
 
       error_file: "/var/log/happy-tourist-server/error.log",
