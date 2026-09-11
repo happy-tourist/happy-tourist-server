@@ -1,0 +1,61 @@
+name: Deploy happy-tourist-server
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: happy-tourist-server-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+
+      - name: Install & build (проверка компиляции)
+        run: |
+          npm ci
+          npm run build
+
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          echo "${{ secrets.SSH_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+          chmod 644 ~/.ssh/known_hosts
+
+      - name: Rsync project to server
+        run: |
+          rsync -az --delete \
+            --exclude '.git' \
+            --exclude 'node_modules' \
+            --exclude 'build' \
+            --exclude '.env' \
+            --exclude '.env.*' \
+            --exclude 'game.db*' \
+            -e "ssh -i ~/.ssh/id_ed25519 -p ${{ secrets.SSH_PORT }} -o StrictHostKeyChecking=yes" \
+            ./ ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:/var/www/happy-tourist-server/
+
+      - name: Build & reload on server
+        run: |
+          ssh -i ~/.ssh/id_ed25519 \
+              -p ${{ secrets.SSH_PORT }} \
+              -o StrictHostKeyChecking=yes \
+              ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} \
+              'bash -se' << 'EOF'
+          set -e
+          cd /var/www/happy-tourist-server
+          npm ci
+          npm run build
+          pm2 reload ecosystem.config.cjs --update-env || pm2 start ecosystem.config.cjs
+          pm2 save
+          EOF
