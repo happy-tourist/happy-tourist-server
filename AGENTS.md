@@ -78,6 +78,7 @@ See `.env.example`:
 | Variable | Role |
 |----------|------|
 | `AUTH_SALT`, `JWT_SECRET`, `SESSION_SECRET` | Required secrets for `@colyseus/auth` |
+| `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` | Google OAuth Web client (`auth.oauth.addProvider` in `src/config/auth.ts`); redirect `…/auth/provider/google/callback` |
 | `DATABASE_URL` | SQLite path (local `./game.db`; prod often `/var/www/happy-tourist-server/game.db`) |
 | `NODE_ENV` | `development` / `production` (CORS, monitor/playground) |
 | `PORT` | Listen port (default `2567`) |
@@ -85,9 +86,10 @@ See `.env.example`:
 `@colyseus/tools` picks `.env.development` or `.env.production` by `NODE_ENV`.
 
 ## Auth And Database
+- `src/config/auth.ts` — `auth.oauth.addProvider('google', …)` (side-effect import from `app.config.ts`); leave built-in `onOAuthProviderCallback` alone.
 - `src/db/index.ts` — `GameDatabase` with `schemas: { users }`.
 - `src/db/schema.ts` — extends built-in `colyseus_users` with `displayName`, `rating` (default 1000), `gamesPlayed`, `gamesWon` (defaults 0). Custom columns need `.default(...)` so built-in `/auth/register` / `/auth/login` do not fail on NOT NULL.
-- Room gate: `MyRoom.onAuth` verifies JWT and returns userdata to `onJoin`.
+- Room gate: `MyRoom.onAuth` verifies JWT and returns userdata to `onJoin` (same for email / anonymous / Google JWT).
 
 ## Rooms
 - `src/app.config.ts` — `lobby` (built-in `LobbyRoom`) + `checkers` (`MyRoom` + `.enableRealtimeListing()`) for live lobby list.
