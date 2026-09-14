@@ -1,8 +1,15 @@
 import { Room, Client } from "colyseus";
 import { JWT } from "@colyseus/auth";
 import { MyRoomState, Seat, Piece } from "./schema/MyRoomState.js";
+import {
+  isBoardSide,
+  validateTouristMove,
+  type BoardSide,
+  type MoveIntent,
+  type PieceSnapshot,
+} from "../game/touristMove.js";
 
-export type BoardSide = "N" | "E" | "S" | "W";
+export type { BoardSide };
 
 /** Unexpected disconnect grace (seconds) before permanent seat remove. */
 export const RECONNECT_GRACE_SECONDS = 30;
@@ -49,9 +56,12 @@ function cellKey(row: number, col: number): string {
 /**
  * Комната `tourist`: до 4 seated — у каждого 4 фигурки (N/E/S/W);
  * старт на 4-й seat. Unexpected drop → grace 30 с + reconnect; consented leave → сразу remove.
- * Ходы / правила партии — later.
+ * Очередь хода + message `move` — authoritative one-step.
  */
 export class MyRoom extends Room<{ state: MyRoomState }> {
+  /** Join-order queue of seated sessionIds (room-private; not synced). */
+  private turnOrder: string[] = [];
+
   /**
    * Проверка JWT-токена перед допуском игрока в комнату.
    * Если токен невалиден — JWT.verify выбросит ошибку,
@@ -67,6 +77,10 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
     this.setState(new MyRoomState());
     // Без maxClients=4 — гости могут смотреть; seated ≤ 4 через seats/started.
     this.setMetadata({ title: "Tourist", status: "waiting" });
+
+    this.onMessage("move", (client, message) => {
+      this.handleMove(client, message);
+    });
   }
 
   onJoin(client: Client, _options: any, auth: any) {
@@ -118,6 +132,7 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
     }
 
     this.state.seats.set(client.sessionId, seat);
+    this.appendTurn(client.sessionId);
 
     if (this.state.seats.size >= 4) {
       this.state.started = true;
@@ -127,6 +142,7 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
 
   /**
    * Unexpected disconnect: hold seat for RECONNECT_GRACE_SECONDS (spectators — no hold).
+   * Does not change current turn (SC-MOVE-17).
    */
   onDrop(client: Client, _code?: number) {
     console.log(`[MyRoom] игрок отвалился: ${client.sessionId}`);
@@ -169,6 +185,7 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
     // До start: kind и клетки снова в пуле.
     // После start: started остаётся true — новым seats не даём.
     this.state.seats.delete(client.sessionId);
+    this.removeFromTurnOrder(client.sessionId);
 
     if (this.state.seats.size === 0) {
       // Зрители не удерживают комнату.
@@ -178,5 +195,115 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
 
   onDispose() {
     console.log("[MyRoom] комната закрыта");
+  }
+
+  private appendTurn(sessionId: string) {
+    this.turnOrder.push(sessionId);
+    if (this.turnOrder.length === 1) {
+      this.state.currentTurnSessionId = sessionId;
+    }
+  }
+
+  private removeFromTurnOrder(sessionId: string) {
+    const idx = this.turnOrder.indexOf(sessionId);
+    if (idx === -1) {
+      return;
+    }
+    const wasCurrent = this.state.currentTurnSessionId === sessionId;
+    this.turnOrder.splice(idx, 1);
+
+    if (this.turnOrder.length === 0) {
+      this.state.currentTurnSessionId = "";
+      return;
+    }
+
+    if (wasCurrent) {
+      // Next at the same index (wrap).
+      this.state.currentTurnSessionId =
+        this.turnOrder[idx % this.turnOrder.length]!;
+    }
+  }
+
+  private advanceTurn() {
+    if (this.turnOrder.length === 0) {
+      this.state.currentTurnSessionId = "";
+      return;
+    }
+    const current = this.state.currentTurnSessionId;
+    const idx = this.turnOrder.indexOf(current);
+    const from = idx >= 0 ? idx : 0;
+    this.state.currentTurnSessionId =
+      this.turnOrder[(from + 1) % this.turnOrder.length]!;
+  }
+
+  private listAllPieces(): PieceSnapshot[] {
+    const out: PieceSnapshot[] = [];
+    this.state.seats.forEach((seat) => {
+      seat.pieces.forEach((p) => {
+        out.push({ side: p.side, row: p.row, col: p.col });
+      });
+    });
+    return out;
+  }
+
+  private listSeatPieces(sessionId: string): PieceSnapshot[] {
+    const seat = this.state.seats.get(sessionId);
+    if (!seat) {
+      return [];
+    }
+    const out: PieceSnapshot[] = [];
+    seat.pieces.forEach((p) => {
+      out.push({ side: p.side, row: p.row, col: p.col });
+    });
+    return out;
+  }
+
+  private parseMoveMessage(message: unknown): MoveIntent | null {
+    if (!message || typeof message !== "object") {
+      return null;
+    }
+    const raw = message as Record<string, unknown>;
+    if (!isBoardSide(raw.side)) {
+      return null;
+    }
+    if (
+      typeof raw.row !== "number" ||
+      typeof raw.col !== "number" ||
+      !Number.isInteger(raw.row) ||
+      !Number.isInteger(raw.col)
+    ) {
+      return null;
+    }
+    return { side: raw.side, row: raw.row, col: raw.col };
+  }
+
+  private handleMove(client: Client, message: unknown) {
+    const seat = this.state.seats.get(client.sessionId);
+    if (!seat) {
+      return; // spectator — reject, no state change
+    }
+    if (this.state.currentTurnSessionId !== client.sessionId) {
+      return; // out of turn
+    }
+
+    const intent = this.parseMoveMessage(message);
+    if (!intent) {
+      return;
+    }
+
+    const moverPieces = this.listSeatPieces(client.sessionId);
+    const allPieces = this.listAllPieces();
+    const validation = validateTouristMove(moverPieces, allPieces, intent);
+    if (!validation.ok) {
+      return;
+    }
+
+    const piece = seat.pieces.get(intent.side);
+    if (!piece) {
+      return;
+    }
+    piece.row = intent.row;
+    piece.col = intent.col;
+    this.advanceTurn();
   }
 }

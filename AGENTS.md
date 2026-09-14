@@ -8,11 +8,11 @@ Skills and OpenSpec live in **happy-tourist-meta**, not in this package. Before 
 This repository is the server-only package. The sibling browser SPA lives in [`../happy-tourist.github.io`](../happy-tourist.github.io) and connects via WebSocket / HTTP (`VITE_COLYSEUS_URL` / `VITE_API_URL` on the client).
 
 ## What It Is Used For
-Main scenarios (target product; move rules later — see **Current vs client contract**):
+Main scenarios (target product; see **Current vs client contract**):
 
 - Register / login / anonymous / Google OAuth auth (`@colyseus/auth` + SQLite user store; callback `…/auth/provider/google/callback`).
 - Create / join tourist rooms; list available rooms for the lobby.
-- Host a `tourist` room for «Счастливый турист» (authoritative seating today; move rules later); lobby listing works today.
+- Host a `tourist` room for «Счастливый турист» (authoritative seating, turn order, one-step `move`); lobby listing works today.
 - Persist basic player profile fields (display name, rating, games played/won) on the auth user table.
 - Serve healthchecks and (in non-production) Colyseus Monitor / Playground.
 
@@ -24,7 +24,7 @@ Indirect users (via the client SPA):
 There is no separate admin API or CMS in this package.
 
 ## Important
-This is a realtime game server, not a REST BFF. Authoritative seating, reconnect grace, and later move rules live here; the client mirrors seats/connectivity and renders pieces + presence on a local board layout.
+This is a realtime game server, not a REST BFF. Authoritative seating, reconnect grace, turn order, and one-step move validation live here; the client mirrors seats/connectivity/`currentTurnSessionId` and renders pieces + presence + local move chrome on a local board layout.
 
 Auth to rooms uses JWT (`MyRoom.onAuth` → `JWT.verify`). CORS in production allows `https://happy-tourist.github.io` with credentials; in development any origin is allowed.
 
@@ -38,7 +38,8 @@ The client (`happy-tourist.github.io`) already assumes:
 | Room type name `tourist` | Registered as `tourist` in `app.config.ts` with `.enableRealtimeListing()` |
 | Live lobby (`LobbyRoom`) | `lobby: defineRoom(LobbyRoom)` — client filters `name: tourist` |
 | Tourist board layout on Game | Client-only tile geometry; server does not sync layout |
-| Synced seats / started / connectivity | `MyRoomState`: `started` + `seats` Map (`touristId` + `pieces` + `connected` / `reconnectUntil`); move messages later |
+| Synced seats / started / turn / connectivity | `MyRoomState`: `started` + `seats` Map (`touristId` + `pieces` + `connected` / `reconnectUntil`) + `currentTurnSessionId` |
+| Move message | `onMessage('move')` `{ side, row, col }`; pure rules in `src/game/touristMove.ts` |
 | Tourist reconnect grace (30 s) | `onDrop` → `allowReconnection`; `onReconnect` restores seat; LobbyRoom has no grace |
 | Lobby `GET /rooms/tourist` | Available (HTTP listing); UI uses live LobbyRoom instead |
 
@@ -93,10 +94,11 @@ See `.env.example`:
 
 ## Rooms
 - `src/app.config.ts` — `lobby` (built-in `LobbyRoom`) + `tourist` (`MyRoom` + `.enableRealtimeListing()`) for live lobby list.
-- `src/rooms/MyRoom.ts` — `Room<MyRoomState>`: JWT `onAuth`; seat assign; unexpected drop → 30 s grace + `allowReconnection`; consented leave → immediate remove; empty seated → `disconnect()` (≤4 seated, no `maxClients=4`); metadata `status` waiting→playing on fourth seat.
-- `src/rooms/schema/MyRoomState.ts` — product sync: `started` + `seats` Map (`touristId` + four `pieces` keyed by side + `connected` / `reconnectUntil`).
+- `src/rooms/MyRoom.ts` — `Room<MyRoomState>`: JWT `onAuth`; seat assign; `turnOrder` + `onMessage('move')`; unexpected drop → 30 s grace + `allowReconnection`; consented leave → immediate remove; empty seated → `disconnect()` (≤4 seated, no `maxClients=4`); metadata `status` waiting→playing on fourth seat.
+- `src/rooms/schema/MyRoomState.ts` — product sync: `started` + `seats` Map (`touristId` + four `pieces` keyed by side + `connected` / `reconnectUntil`) + `currentTurnSessionId`.
+- `src/game/touristMove.ts` — pure one-step validate/apply (playable cells, Chebyshev, occupancy).
 
-Product room name is `tourist`; add move messages when board-game rules land.
+Product room name is `tourist`; client submits moves via store `sendMove` → `room.send('move', { side, row, col })`.
 
 ## HTTP Surface
 From `src/app.config.ts` and Colyseus auth:
@@ -121,6 +123,7 @@ CORS middleware must stay first in the Express hook (GitHub Pages ↔ server cro
 - `src/db/` - GameDatabase init + Drizzle user schema extension.
 - `src/rooms/` - room handlers.
 - `src/rooms/schema/` - `@colyseus/schema` state.
+- `src/game/` - pure authoritative move rules (no Colyseus I/O).
 
 Outside `src`:
 
@@ -135,16 +138,17 @@ Typical paths:
 
 - HTTP auth → `@colyseus/auth` + `GameDatabase` / `users` schema.
 - Matchmaking → Colyseus `lobby` + `tourist` realtime listing; HTTP `/rooms/:roomName` remains.
-- Gameplay (later) → `Room` handler + schema state → client `onStateChange` / game messages.
+- Gameplay → `Room` handler + schema state + `src/game/*` pure rules → client `onStateChange` / `move` messages.
 
 Keep rules authoritative in the room; do not trust client board state. Prefer extending `users` schema defaults carefully so register/login stay compatible.
 
 ## Tests And Loadtest
-- `test/MyRoom.test.ts` — boots `appConfig`, signs JWT, creates `tourist`, connects client; seating SC-PIECE-01…08 + reconnect grace SC-PIECE-11…16; lobby live-list cases (SC-LOBBY-02/03).
+- `test/MyRoom.test.ts` — boots `appConfig`, signs JWT, creates `tourist`, connects client; seating SC-PIECE-01…08 + reconnect grace SC-PIECE-11…16; turn/move SC-MOVE-*; lobby live-list cases (SC-LOBBY-02/03).
+- `test/touristMove.test.ts` — pure `validateTouristMove` / playable geometry (no room I/O).
 - `test/theme.test.ts` — `POST /api/theme`: unauthenticated/anonymous reject; registered persist + login userdata; `GET /api/theme` after POST with same JWT (SC-THEME-08) and with older session JWT after another device saves (SC-THEME-09).
 - `loadtest/example.ts` — `joinOrCreate` scaffold; `--room tourist` / `--numClients` via npm script.
 
-Update tests when the registered room name, auth contract, reconnect grace, or preference HTTP changes.
+Update tests when the registered room name, auth contract, reconnect grace, move/turn contract, or preference HTTP changes.
 
 ## Deploy
 - CI: push to `main` → compile locally in Actions → rsync (excludes `.git`, `node_modules`, `build`, `.env*`, `game.db*`) → remote `npm ci`, `npm run build`, `pm2 reload`.
@@ -172,4 +176,4 @@ Typical Cursor chat workflow: `/opsx-explore` → `/opsx-propose` → artifact r
 Commands (`npm test`, `npm run build`, `npm run dev`, `npm run loadtest`) are run by the **agent** from this package root. Do not wait for user confirmation; fix failures before claiming done.
 
 ## Related Package
-- [`../happy-tourist.github.io`](../happy-tourist.github.io) — Vue 3 + Quasar SPA (GitHub Pages). Prefer changing room names, state schema, and move protocol in coordination with the client; the client assumes room type `tourist`, mirrors seats/`started`/connectivity, renders pieces + presence, and persists the tourist reconnection token in `localStorage` (then `reconnect` → `joinById`) until move rules land.
+- [`../happy-tourist.github.io`](../happy-tourist.github.io) — Vue 3 + Quasar SPA (GitHub Pages). Prefer changing room names, state schema, and move protocol in coordination with the client; the client assumes room type `tourist`, mirrors seats/`started`/`currentTurnSessionId`/connectivity, renders pieces + presence + local move chrome, persists the tourist reconnection token in `localStorage` (then `reconnect` → `joinById`), and submits `move` via `sendMove`.

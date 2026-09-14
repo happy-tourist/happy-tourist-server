@@ -32,6 +32,8 @@ export const MyRoomState = schema(
   {
     started: t.boolean().default(false),
     seats: t.map(Seat), // key = sessionId
+    /** sessionId of seated player whose turn it is; `""` if no seated. */
+    currentTurnSessionId: t.string().default(""),
   },
   "MyRoomState",
 );
