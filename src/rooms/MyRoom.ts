@@ -4,6 +4,9 @@ import { MyRoomState, Seat, Piece } from "./schema/MyRoomState.js";
 
 export type BoardSide = "N" | "E" | "S" | "W";
 
+/** Unexpected disconnect grace (seconds) before permanent seat remove. */
+export const RECONNECT_GRACE_SECONDS = 30;
+
 const TOURIST_IDS = [1, 2, 3, 4] as const;
 const SIDES: BoardSide[] = ["N", "E", "S", "W"];
 
@@ -45,7 +48,8 @@ function cellKey(row: number, col: number): string {
 
 /**
  * Комната `tourist`: до 4 seated — у каждого 4 фигурки (N/E/S/W);
- * старт на 4-й seat. Ходы / правила партии — later.
+ * старт на 4-й seat. Unexpected drop → grace 30 с + reconnect; consented leave → сразу remove.
+ * Ходы / правила партии — later.
  */
 export class MyRoom extends Room<{ state: MyRoomState }> {
   /**
@@ -91,7 +95,11 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
     }
 
     const touristId = pickUniform(availableIds);
-    const seat = new Seat({ touristId });
+    const seat = new Seat({
+      touristId,
+      connected: true,
+      reconnectUntil: 0,
+    });
 
     for (const side of SIDES) {
       const free = START_CELLS[side].filter(
@@ -117,6 +125,39 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
     }
   }
 
+  /**
+   * Unexpected disconnect: hold seat for RECONNECT_GRACE_SECONDS (spectators — no hold).
+   */
+  onDrop(client: Client, _code?: number) {
+    console.log(`[MyRoom] игрок отвалился: ${client.sessionId}`);
+
+    const seat = this.state.seats.get(client.sessionId);
+    if (!seat) {
+      // Зритель — grace не нужен; onLeave снимет клиента.
+      return;
+    }
+
+    seat.connected = false;
+    seat.reconnectUntil = Date.now() + RECONNECT_GRACE_SECONDS * 1000;
+    this.allowReconnection(client, RECONNECT_GRACE_SECONDS);
+  }
+
+  onReconnect(client: Client) {
+    console.log(`[MyRoom] игрок переподключился: ${client.sessionId}`);
+
+    const seat = this.state.seats.get(client.sessionId);
+    if (!seat) {
+      return;
+    }
+
+    seat.connected = true;
+    seat.reconnectUntil = 0;
+  }
+
+  /**
+   * Permanent leave: consented exit, grace timeout, or reconnect denied.
+   * After last seated remove — dispose even if spectators remain (D4).
+   */
   onLeave(client: Client, _code?: number) {
     console.log(`[MyRoom] игрок вышел: ${client.sessionId}`);
 
@@ -128,6 +169,11 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
     // До start: kind и клетки снова в пуле.
     // После start: started остаётся true — новым seats не даём.
     this.state.seats.delete(client.sessionId);
+
+    if (this.state.seats.size === 0) {
+      // Зрители не удерживают комнату.
+      void this.disconnect();
+    }
   }
 
   onDispose() {

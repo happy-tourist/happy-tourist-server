@@ -24,7 +24,7 @@ Indirect users (via the client SPA):
 There is no separate admin API or CMS in this package.
 
 ## Important
-This is a realtime game server, not a REST BFF. Authoritative seating (and later move rules) live here; the client mirrors seats and renders pieces on a local board layout.
+This is a realtime game server, not a REST BFF. Authoritative seating, reconnect grace, and later move rules live here; the client mirrors seats/connectivity and renders pieces + presence on a local board layout.
 
 Auth to rooms uses JWT (`MyRoom.onAuth` → `JWT.verify`). CORS in production allows `https://happy-tourist.github.io` with credentials; in development any origin is allowed.
 
@@ -38,7 +38,8 @@ The client (`happy-tourist.github.io`) already assumes:
 | Room type name `tourist` | Registered as `tourist` in `app.config.ts` with `.enableRealtimeListing()` |
 | Live lobby (`LobbyRoom`) | `lobby: defineRoom(LobbyRoom)` — client filters `name: tourist` |
 | Tourist board layout on Game | Client-only tile geometry; server does not sync layout |
-| Synced seats / started | `MyRoomState`: `started` + `seats` Map (`touristId` + `pieces` Map keyed by side → `{ side, row, col }`); move messages later |
+| Synced seats / started / connectivity | `MyRoomState`: `started` + `seats` Map (`touristId` + `pieces` + `connected` / `reconnectUntil`); move messages later |
+| Tourist reconnect grace (30 s) | `onDrop` → `allowReconnection`; `onReconnect` restores seat; LobbyRoom has no grace |
 | Lobby `GET /rooms/tourist` | Available (HTTP listing); UI uses live LobbyRoom instead |
 
 When implementing the tourist game, prefer aligning room name, schema, and messages with the client rather than changing the client unilaterally.
@@ -92,8 +93,8 @@ See `.env.example`:
 
 ## Rooms
 - `src/app.config.ts` — `lobby` (built-in `LobbyRoom`) + `tourist` (`MyRoom` + `.enableRealtimeListing()`) for live lobby list.
-- `src/rooms/MyRoom.ts` — `Room<MyRoomState>`: JWT `onAuth`; seat assign/remove in `onJoin`/`onLeave` (≤4 seated, no `maxClients=4`); metadata `status` waiting→playing on fourth seat.
-- `src/rooms/schema/MyRoomState.ts` — product sync: `started` + `seats` Map (`touristId` + four `pieces` keyed by side).
+- `src/rooms/MyRoom.ts` — `Room<MyRoomState>`: JWT `onAuth`; seat assign; unexpected drop → 30 s grace + `allowReconnection`; consented leave → immediate remove; empty seated → `disconnect()` (≤4 seated, no `maxClients=4`); metadata `status` waiting→playing on fourth seat.
+- `src/rooms/schema/MyRoomState.ts` — product sync: `started` + `seats` Map (`touristId` + four `pieces` keyed by side + `connected` / `reconnectUntil`).
 
 Product room name is `tourist`; add move messages when board-game rules land.
 
@@ -139,11 +140,11 @@ Typical paths:
 Keep rules authoritative in the room; do not trust client board state. Prefer extending `users` schema defaults carefully so register/login stay compatible.
 
 ## Tests And Loadtest
-- `test/MyRoom.test.ts` — boots `appConfig`, signs JWT, creates `tourist`, connects client; includes lobby live-list cases (SC-LOBBY-02/03).
+- `test/MyRoom.test.ts` — boots `appConfig`, signs JWT, creates `tourist`, connects client; seating SC-PIECE-01…08 + reconnect grace SC-PIECE-11…16; lobby live-list cases (SC-LOBBY-02/03).
 - `test/theme.test.ts` — `POST /api/theme`: unauthenticated/anonymous reject; registered persist + login userdata; `GET /api/theme` after POST with same JWT (SC-THEME-08) and with older session JWT after another device saves (SC-THEME-09).
 - `loadtest/example.ts` — `joinOrCreate` scaffold; `--room tourist` / `--numClients` via npm script.
 
-Update tests when the registered room name, auth contract, or preference HTTP changes.
+Update tests when the registered room name, auth contract, reconnect grace, or preference HTTP changes.
 
 ## Deploy
 - CI: push to `main` → compile locally in Actions → rsync (excludes `.git`, `node_modules`, `build`, `.env*`, `game.db*`) → remote `npm ci`, `npm run build`, `pm2 reload`.
@@ -171,4 +172,4 @@ Typical Cursor chat workflow: `/opsx-explore` → `/opsx-propose` → artifact r
 Commands (`npm test`, `npm run build`, `npm run dev`, `npm run loadtest`) are run by the **agent** from this package root. Do not wait for user confirmation; fix failures before claiming done.
 
 ## Related Package
-- [`../happy-tourist.github.io`](../happy-tourist.github.io) — Vue 3 + Quasar SPA (GitHub Pages). Prefer changing room names, state schema, and move protocol in coordination with the client; the client assumes room type `tourist`, mirrors seats/`started`, and renders pieces until move rules land.
+- [`../happy-tourist.github.io`](../happy-tourist.github.io) — Vue 3 + Quasar SPA (GitHub Pages). Prefer changing room names, state schema, and move protocol in coordination with the client; the client assumes room type `tourist`, mirrors seats/`started`/connectivity, renders pieces + presence, and uses tourist reconnect until move rules land.

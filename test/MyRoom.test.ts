@@ -3,7 +3,10 @@ import { ColyseusTestServer, boot } from "@colyseus/testing";
 import { JWT } from "@colyseus/auth";
 
 import appConfig from "../src/app.config.js";
-import type { BoardSide } from "../src/rooms/MyRoom.js";
+import {
+  RECONNECT_GRACE_SECONDS,
+  type BoardSide,
+} from "../src/rooms/MyRoom.js";
 
 const SIDES: BoardSide[] = ["N", "E", "S", "W"];
 
@@ -42,8 +45,32 @@ type PieceView = {
 
 type SeatView = {
   touristId: number;
+  connected?: boolean;
+  reconnectUntil?: number;
   pieces: { forEach: (cb: (p: PieceView, key?: string) => void) => void; size?: number; get?: (k: string) => PieceView | undefined };
 };
+
+function seatBySession(state: any, sessionId: string): SeatView | undefined {
+  return state.seats?.get(sessionId);
+}
+
+/** Unexpected drop without SDK auto-reconnect (tests control reconnect manually). */
+async function unexpectedDrop(client: { reconnection: { enabled: boolean }; leave: (consented?: boolean) => Promise<number> }) {
+  client.reconnection.enabled = false;
+  await client.leave(false);
+}
+
+function assertOfflineGrace(seat: SeatView, nowMs: number) {
+  assert.strictEqual(seat.connected, false);
+  const until = seat.reconnectUntil ?? 0;
+  assert.ok(until > nowMs, "reconnectUntil must be in the future");
+  const delta = until - nowMs;
+  const expected = RECONNECT_GRACE_SECONDS * 1000;
+  assert.ok(
+    Math.abs(delta - expected) < 3000,
+    `reconnectUntil delta ${delta}ms should be ~${expected}ms`,
+  );
+}
 
 function seatOf(client: { sessionId: string; state: any }): SeatView | undefined {
   return client.state.seats?.get(client.sessionId);
@@ -262,11 +289,13 @@ describe("testing your Colyseus app", () => {
     assert.strictEqual(allRoomPieces(room.state).length, piecesBefore);
   });
 
-  // SC-PIECE-07: Leave before start frees kind and cells
+  // SC-PIECE-07: Leave before start frees kind and cells (consented)
   it("SC-PIECE-07: leave before start frees kind and cells", async () => {
     const room = await colyseus.createRoom("tourist", {});
     const first = await connectSeat(room, 1, "p1");
     const firstSeat = seatOf(first)!;
+    assert.strictEqual(firstSeat.connected, true);
+    assert.strictEqual(firstSeat.reconnectUntil ?? 0, 0);
     const freedId = firstSeat.touristId;
     const freedCells = new Set(
       listPieces(firstSeat).map((p) => `${p.row},${p.col}`),
@@ -275,7 +304,7 @@ describe("testing your Colyseus app", () => {
     // Keep the room alive while the seated player leaves.
     await connectSeat(room, 2, "holder");
 
-    await first.leave();
+    await first.leave(); // consented → immediate seat remove
     await room.waitForNextPatch();
 
     assert.strictEqual(room.state.seats.has(first.sessionId), false);
@@ -301,7 +330,7 @@ describe("testing your Colyseus app", () => {
     }
   });
 
-  // SC-PIECE-08: Leave after start does not reopen seating
+  // SC-PIECE-08: Leave after start does not reopen seating (consented)
   it("SC-PIECE-08: leave after start does not reopen seating", async () => {
     const room = await colyseus.createRoom("tourist", {});
     const seated = [];
@@ -315,7 +344,7 @@ describe("testing your Colyseus app", () => {
     const leavingPieces = listPieces(seatOf(leaving)!);
     assert.strictEqual(leavingPieces.length, 4);
 
-    await leaving.leave();
+    await leaving.leave(); // consented → immediate seat remove
     await room.waitForNextPatch();
 
     assert.strictEqual(room.state.seats.has(leavingId), false);
@@ -327,5 +356,182 @@ describe("testing your Colyseus app", () => {
     assert.strictEqual(seatOf(late), undefined);
     assert.strictEqual(room.state.seats.size, 3);
     assert.strictEqual(room.state.started, true);
+  });
+
+  // SC-PIECE-11: Unexpected disconnect before start holds the seat
+  it("SC-PIECE-11: unexpected disconnect before start holds the seat", async () => {
+    const room = await colyseus.createRoom("tourist", {});
+    const first = await connectSeat(room, 1, "p1");
+    const observer = await connectSeat(room, 2, "observer");
+    const sessionId = first.sessionId;
+    const piecesBefore = listPieces(seatOf(first)!);
+    assert.strictEqual(seatOf(first)!.connected, true);
+
+    const now = Date.now();
+    await unexpectedDrop(first);
+    await room.waitForNextPatch();
+
+    assert.ok(room.state.seats.has(sessionId), "seat must remain during grace");
+    assert.strictEqual(room.state.seats.size, 2);
+    assertFourPiecesOnSides(room.state.seats.get(sessionId));
+    assert.strictEqual(listPieces(room.state.seats.get(sessionId)).length, piecesBefore.length);
+
+    const held = seatBySession(observer.state, sessionId)!;
+    assertOfflineGrace(held, now);
+    assertOfflineGrace(room.state.seats.get(sessionId), now);
+  });
+
+  // SC-PIECE-12: Unexpected disconnect after start holds the seat
+  it("SC-PIECE-12: unexpected disconnect after start holds the seat", async () => {
+    const room = await colyseus.createRoom("tourist", {});
+    const seated = [];
+    for (let i = 0; i < 4; i++) {
+      seated.push(await connectSeat(room, i + 1, `p${i + 1}`));
+    }
+    assert.strictEqual(room.state.started, true);
+
+    const dropping = seated[0]!;
+    const sessionId = dropping.sessionId;
+    const now = Date.now();
+    await unexpectedDrop(dropping);
+    await room.waitForNextPatch();
+
+    assert.ok(room.state.seats.has(sessionId));
+    assert.strictEqual(room.state.seats.size, 4);
+    assert.strictEqual(room.state.started, true);
+    assertFourPiecesOnSides(room.state.seats.get(sessionId));
+    assertOfflineGrace(room.state.seats.get(sessionId), now);
+
+    const late = await connectSeat(room, 99, "spectator");
+    assert.strictEqual(seatOf(late), undefined);
+    assert.strictEqual(room.state.seats.size, 4);
+    assert.strictEqual(room.state.started, true);
+  });
+
+  // SC-PIECE-13: Reconnect within grace restores the same seat
+  it("SC-PIECE-13: reconnect within grace restores the same seat", async () => {
+    const room = await colyseus.createRoom("tourist", {});
+    const first = await connectSeat(room, 1, "p1");
+    const observer = await connectSeat(room, 2, "observer");
+    const sessionId = first.sessionId;
+    const touristId = seatOf(first)!.touristId;
+    const token = first.reconnectionToken;
+
+    await unexpectedDrop(first);
+    await room.waitForNextPatch();
+    assert.strictEqual(room.state.seats.get(sessionId).connected, false);
+
+    await authAs(1, "p1");
+    const reconnected = await colyseus.sdk.reconnect(token);
+    await room.waitForNextPatch();
+
+    assert.strictEqual(reconnected.sessionId, sessionId);
+    const seat = room.state.seats.get(sessionId);
+    assert.ok(seat);
+    assert.strictEqual(seat.touristId, touristId);
+    assert.strictEqual(seat.connected, true);
+    assert.strictEqual(seat.reconnectUntil, 0);
+    assertFourPiecesOnSides(seat);
+
+    const observed = seatBySession(observer.state, sessionId)!;
+    assert.strictEqual(observed.connected, true);
+    assert.strictEqual(observed.reconnectUntil ?? 0, 0);
+  });
+
+  // SC-PIECE-14: Grace timeout removes the seat
+  it("SC-PIECE-14: grace timeout removes the seat", async function () {
+    this.timeout(RECONNECT_GRACE_SECONDS * 1000 + 15000);
+
+    const room = await colyseus.createRoom("tourist", {});
+    const first = await connectSeat(room, 1, "p1");
+    await connectSeat(room, 2, "holder");
+    const sessionId = first.sessionId;
+    const freedId = seatOf(first)!.touristId;
+    const freedCells = new Set(
+      listPieces(seatOf(first)!).map((p) => `${p.row},${p.col}`),
+    );
+
+    await unexpectedDrop(first);
+    await room.waitForNextPatch();
+    assert.ok(room.state.seats.has(sessionId));
+
+    await new Promise((r) => setTimeout(r, RECONNECT_GRACE_SECONDS * 1000 + 1500));
+    await room.waitForNextPatch();
+
+    assert.strictEqual(room.state.seats.has(sessionId), false);
+    assert.strictEqual(room.state.started, false);
+
+    // Freed kind/cells reusable before start.
+    const seenIds = new Set<number>();
+    const seenCells = new Set<string>();
+    room.state.seats.forEach((seat: SeatView) => {
+      seenIds.add(seat.touristId);
+      listPieces(seat).forEach((p) => seenCells.add(`${p.row},${p.col}`));
+    });
+    for (let i = 0; i < 3; i++) {
+      const c = await connectSeat(room, 20 + i, `after-timeout-${i}`);
+      const s = seatOf(c)!;
+      seenIds.add(s.touristId);
+      listPieces(s).forEach((p) => seenCells.add(`${p.row},${p.col}`));
+    }
+    assert.ok(seenIds.has(freedId));
+    for (const cell of freedCells) {
+      assert.ok(seenCells.has(cell));
+    }
+  });
+
+  // SC-PIECE-15: Last seated removal closes the room with spectators present
+  it("SC-PIECE-15: last seated removal closes the room with spectators present", async () => {
+    const room = await colyseus.createRoom("tourist", {});
+    const s1 = await connectSeat(room, 10, "a");
+    const s2 = await connectSeat(room, 11, "b");
+    const s3 = await connectSeat(room, 12, "c");
+    const s4 = await connectSeat(room, 13, "d");
+    assert.strictEqual(room.state.started, true);
+
+    await s2.leave();
+    await s3.leave();
+    await s4.leave();
+    await room.waitForNextPatch();
+    assert.strictEqual(room.state.seats.size, 1);
+
+    const guest = await connectSeat(room, 14, "spectator");
+    assert.strictEqual(seatOf(guest), undefined);
+    assert.strictEqual(room.state.seats.size, 1);
+
+    const leftPromise = new Promise<number>((resolve) => {
+      guest.onLeave((code) => resolve(code));
+    });
+    await s1.leave(); // consented permanent leave of last seated
+    await leftPromise;
+
+    assert.strictEqual(room.state.seats.size, 0);
+  });
+
+  // SC-PIECE-16: Seat connectivity is synchronized
+  it("SC-PIECE-16: seat connectivity is synchronized", async () => {
+    const room = await colyseus.createRoom("tourist", {});
+    const first = await connectSeat(room, 1, "p1");
+    const observer = await connectSeat(room, 2, "observer");
+    const sessionId = first.sessionId;
+
+    assert.strictEqual(seatBySession(observer.state, sessionId)!.connected, true);
+    assert.strictEqual(seatBySession(observer.state, sessionId)!.reconnectUntil ?? 0, 0);
+
+    const now = Date.now();
+    const token = first.reconnectionToken;
+    await unexpectedDrop(first);
+    await room.waitForNextPatch();
+
+    const offline = seatBySession(observer.state, sessionId)!;
+    assertOfflineGrace(offline, now);
+
+    await authAs(1, "p1");
+    await colyseus.sdk.reconnect(token);
+    await room.waitForNextPatch();
+
+    const online = seatBySession(observer.state, sessionId)!;
+    assert.strictEqual(online.connected, true);
+    assert.strictEqual(online.reconnectUntil ?? 0, 0);
   });
 });
