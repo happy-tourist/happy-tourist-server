@@ -38,7 +38,7 @@ The client (`happy-tourist.github.io`) already assumes:
 | Room type name `tourist` | Registered as `tourist` in `app.config.ts` with `.enableRealtimeListing()` |
 | Live lobby (`LobbyRoom`) | `lobby: defineRoom(LobbyRoom)` — client filters `name: tourist` |
 | Tourist board layout on Game | Client-only tile geometry; server does not sync layout |
-| Synced seats / started | `MyRoomState`: `started` + `seats` Map (`touristId`, `side`, `row`, `col`); move messages later |
+| Synced seats / started | `MyRoomState`: `started` + `seats` Map (`touristId` + `pieces` Map keyed by side → `{ side, row, col }`); move messages later |
 | Lobby `GET /rooms/tourist` | Available (HTTP listing); UI uses live LobbyRoom instead |
 
 When implementing the tourist game, prefer aligning room name, schema, and messages with the client rather than changing the client unilaterally.
@@ -93,7 +93,7 @@ See `.env.example`:
 ## Rooms
 - `src/app.config.ts` — `lobby` (built-in `LobbyRoom`) + `tourist` (`MyRoom` + `.enableRealtimeListing()`) for live lobby list.
 - `src/rooms/MyRoom.ts` — `Room<MyRoomState>`: JWT `onAuth`; seat assign/remove in `onJoin`/`onLeave` (≤4 seated, no `maxClients=4`); metadata `status` waiting→playing on fourth seat.
-- `src/rooms/schema/MyRoomState.ts` — product sync: `started` + `seats` Map (`touristId`, `side`, `row`, `col`).
+- `src/rooms/schema/MyRoomState.ts` — product sync: `started` + `seats` Map (`touristId` + four `pieces` keyed by side).
 
 Product room name is `tourist`; add move messages when board-game rules land.
 

@@ -1,6 +1,6 @@
 import { Room, Client } from "colyseus";
 import { JWT } from "@colyseus/auth";
-import { MyRoomState, Seat } from "./schema/MyRoomState.js";
+import { MyRoomState, Seat, Piece } from "./schema/MyRoomState.js";
 
 export type BoardSide = "N" | "E" | "S" | "W";
 
@@ -39,9 +39,13 @@ function pickUniform<T>(items: readonly T[]): T {
   return items[Math.floor(Math.random() * items.length)]!;
 }
 
+function cellKey(row: number, col: number): string {
+  return `${row},${col}`;
+}
+
 /**
- * Комната `tourist`: рассадка до 4 фигурок, старт на 4-й seat.
- * Ходы / правила партии — later.
+ * Комната `tourist`: до 4 seated — у каждого 4 фигурки (N/E/S/W);
+ * старт на 4-й seat. Ходы / правила партии — later.
  */
 export class MyRoom extends Room<{ state: MyRoomState }> {
   /**
@@ -73,31 +77,39 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
     }
 
     const usedIds = new Set<number>();
-    const usedSides = new Set<string>();
+    const occupied = new Set<string>();
     this.state.seats.forEach((seat) => {
       usedIds.add(seat.touristId);
-      usedSides.add(seat.side);
+      seat.pieces.forEach((piece) => {
+        occupied.add(cellKey(piece.row, piece.col));
+      });
     });
 
     const availableIds = TOURIST_IDS.filter((id) => !usedIds.has(id));
-    const availableSides = SIDES.filter((side) => !usedSides.has(side));
-    if (availableIds.length === 0 || availableSides.length === 0) {
+    if (availableIds.length === 0) {
       return;
     }
 
     const touristId = pickUniform(availableIds);
-    const side = pickUniform(availableSides);
-    const cell = pickUniform(START_CELLS[side]);
+    const seat = new Seat({ touristId });
 
-    this.state.seats.set(
-      client.sessionId,
-      new Seat({
-        touristId,
+    for (const side of SIDES) {
+      const free = START_CELLS[side].filter(
+        (c) => !occupied.has(cellKey(c.row, c.col)),
+      );
+      if (free.length === 0) {
+        // Не должно случаться при ≤4 seats и 4 стартах на сторону.
+        return;
+      }
+      const cell = pickUniform(free);
+      occupied.add(cellKey(cell.row, cell.col));
+      seat.pieces.set(
         side,
-        row: cell.row,
-        col: cell.col,
-      }),
-    );
+        new Piece({ side, row: cell.row, col: cell.col }),
+      );
+    }
+
+    this.state.seats.set(client.sessionId, seat);
 
     if (this.state.seats.size >= 4) {
       this.state.started = true;
@@ -112,9 +124,10 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
       return;
     }
 
-    this.state.seats.delete(client.sessionId);
-    // До start: kind/side снова в пуле (просто нет в seats).
+    // Удаляем seat целиком (все 4 pieces).
+    // До start: kind и клетки снова в пуле.
     // После start: started остаётся true — новым seats не даём.
+    this.state.seats.delete(client.sessionId);
   }
 
   onDispose() {

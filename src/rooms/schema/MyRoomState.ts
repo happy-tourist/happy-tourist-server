@@ -1,11 +1,24 @@
 import { schema, t, type SchemaType } from "@colyseus/schema";
 
-export const Seat = schema(
+/** One tourist token on a board side. */
+export const Piece = schema(
   {
-    touristId: t.uint8(),
-    side: t.string(),
+    side: t.string(), // "N"|"E"|"S"|"W"
     row: t.uint8(),
     col: t.uint8(),
+  },
+  "Piece",
+);
+export type Piece = SchemaType<typeof Piece>;
+
+/**
+ * Seated player: unique tourist kind + exactly four pieces (one per side).
+ * Key of `pieces` map = side letter (N|E|S|W).
+ */
+export const Seat = schema(
+  {
+    touristId: t.uint8(), // 1…4
+    pieces: t.map(Piece),
   },
   "Seat",
 );
@@ -14,7 +27,7 @@ export type Seat = SchemaType<typeof Seat>;
 export const MyRoomState = schema(
   {
     started: t.boolean().default(false),
-    seats: t.map(Seat),
+    seats: t.map(Seat), // key = sessionId
   },
   "MyRoomState",
 );

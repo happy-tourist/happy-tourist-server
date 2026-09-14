@@ -5,6 +5,8 @@ import { JWT } from "@colyseus/auth";
 import appConfig from "../src/app.config.js";
 import type { BoardSide } from "../src/rooms/MyRoom.js";
 
+const SIDES: BoardSide[] = ["N", "E", "S", "W"];
+
 const START_CELLS: Record<BoardSide, ReadonlyArray<{ row: number; col: number }>> = {
   N: [
     { row: 0, col: 3 },
@@ -32,21 +34,47 @@ const START_CELLS: Record<BoardSide, ReadonlyArray<{ row: number; col: number }>
   ],
 };
 
-type SeatView = {
-  touristId: number;
+type PieceView = {
   side: string;
   row: number;
   col: number;
+};
+
+type SeatView = {
+  touristId: number;
+  pieces: { forEach: (cb: (p: PieceView, key?: string) => void) => void; size?: number; get?: (k: string) => PieceView | undefined };
 };
 
 function seatOf(client: { sessionId: string; state: any }): SeatView | undefined {
   return client.state.seats?.get(client.sessionId);
 }
 
-function listSeats(state: any): SeatView[] {
-  const out: SeatView[] = [];
-  state.seats?.forEach((seat: SeatView) => out.push(seat));
+function listPieces(seat: SeatView): PieceView[] {
+  const out: PieceView[] = [];
+  seat.pieces?.forEach((p) => out.push(p));
   return out;
+}
+
+function allRoomPieces(state: any): PieceView[] {
+  const out: PieceView[] = [];
+  state.seats?.forEach((seat: SeatView) => {
+    seat.pieces?.forEach((p) => out.push(p));
+  });
+  return out;
+}
+
+function assertFourPiecesOnSides(seat: SeatView) {
+  const pieces = listPieces(seat);
+  assert.strictEqual(pieces.length, 4, "seat must have exactly four pieces");
+  const sides = pieces.map((p) => p.side).sort();
+  assert.deepStrictEqual(sides, ["E", "N", "S", "W"]);
+  for (const piece of pieces) {
+    const allowed = START_CELLS[piece.side as BoardSide];
+    assert.ok(
+      allowed.some((c) => c.row === piece.row && c.col === piece.col),
+      `piece side ${piece.side}: (${piece.row},${piece.col}) must be a start cell`,
+    );
+  }
 }
 
 describe("testing your Colyseus app", () => {
@@ -115,24 +143,21 @@ describe("testing your Colyseus app", () => {
     await lobby.leave();
   });
 
-  it("SC-PIECE-01: first join receives a seat", async () => {
+  // SC-PIECE-01: First join receives four pieces on all sides
+  it("SC-PIECE-01: first join receives four pieces on all sides", async () => {
     const room = await colyseus.createRoom("tourist", {});
     const client = await connectSeat(room, 1, "p1");
 
     const seat = seatOf(client);
     assert.ok(seat, "seat must be synced for first joiner");
     assert.ok([1, 2, 3, 4].includes(seat.touristId));
-    assert.ok(["N", "E", "S", "W"].includes(seat.side));
-    const allowed = START_CELLS[seat.side as BoardSide];
-    assert.ok(
-      allowed.some((c) => c.row === seat.row && c.col === seat.col),
-      `start cell (${seat.row},${seat.col}) must belong to side ${seat.side}`,
-    );
+    assertFourPiecesOnSides(seat);
     assert.strictEqual(client.state.started, false);
     assert.strictEqual(room.state.seats.size, 1);
   });
 
-  it("SC-PIECE-02: kinds and sides stay unique", async () => {
+  // SC-PIECE-02: Tourist kinds stay unique among players
+  it("SC-PIECE-02: tourist kinds stay unique among players", async () => {
     const room = await colyseus.createRoom("tourist", {});
     const c1 = await connectSeat(room, 1, "p1");
     const c2 = await connectSeat(room, 2, "p2");
@@ -140,55 +165,78 @@ describe("testing your Colyseus app", () => {
     const s1 = seatOf(c1)!;
     const s2 = seatOf(c2)!;
     assert.notStrictEqual(s1.touristId, s2.touristId);
-    assert.notStrictEqual(s1.side, s2.side);
+    assertFourPiecesOnSides(s1);
+    assertFourPiecesOnSides(s2);
 
-    const seats = listSeats(room.state);
-    const ids = seats.map((s) => s.touristId);
-    const sides = seats.map((s) => s.side);
+    const ids: number[] = [];
+    room.state.seats.forEach((seat: SeatView) => ids.push(seat.touristId));
     assert.strictEqual(new Set(ids).size, ids.length);
-    assert.strictEqual(new Set(sides).size, sides.length);
   });
 
-  it("SC-PIECE-03: start cell lies on the assigned side", async () => {
+  // SC-PIECE-03: Start cells lie on the assigned side and stay free
+  it("SC-PIECE-03: start cells lie on the assigned side and stay free", async () => {
     const room = await colyseus.createRoom("tourist", {});
     const clients = [];
     for (let i = 0; i < 4; i++) {
       clients.push(await connectSeat(room, i + 1, `p${i + 1}`));
     }
 
+    const cellKeys = new Set<string>();
     for (const client of clients) {
       const seat = seatOf(client)!;
-      const allowed = START_CELLS[seat.side as BoardSide];
+      assertFourPiecesOnSides(seat);
+      for (const piece of listPieces(seat)) {
+        const key = `${piece.row},${piece.col}`;
+        assert.ok(!cellKeys.has(key), `duplicate cell ${key}`);
+        cellKeys.add(key);
+      }
+    }
+    assert.strictEqual(cellKeys.size, 16);
+  });
+
+  // SC-PIECE-04: Second player uses remaining cells on each side
+  it("SC-PIECE-04: second player uses remaining cells on each side", async () => {
+    const room = await colyseus.createRoom("tourist", {});
+    const c1 = await connectSeat(room, 1, "p1");
+    const c2 = await connectSeat(room, 2, "p2");
+
+    const s1 = seatOf(c1)!;
+    const s2 = seatOf(c2)!;
+    assertFourPiecesOnSides(s1);
+    assertFourPiecesOnSides(s2);
+
+    const occupied = new Set(
+      listPieces(s1).map((p) => `${p.row},${p.col}`),
+    );
+    for (const piece of listPieces(s2)) {
       assert.ok(
-        allowed.some((c) => c.row === seat.row && c.col === seat.col),
-        `side ${seat.side}: (${seat.row},${seat.col}) not in start cells`,
+        !occupied.has(`${piece.row},${piece.col}`),
+        `second player cell (${piece.row},${piece.col}) must be free of first`,
+      );
+    }
+
+    for (const side of SIDES) {
+      const p1 = listPieces(s1).find((p) => p.side === side);
+      const p2 = listPieces(s2).find((p) => p.side === side);
+      assert.ok(p1 && p2, `both players must have a piece on side ${side}`);
+      assert.notStrictEqual(
+        `${p1!.row},${p1!.col}`,
+        `${p2!.row},${p2!.col}`,
+        `side ${side} cells must differ`,
       );
     }
   });
 
-  it("SC-PIECE-04: fifth connection is a spectator after four seats", async () => {
-    const room = await colyseus.createRoom("tourist", {});
-    for (let i = 0; i < 4; i++) {
-      await connectSeat(room, i + 1, `p${i + 1}`);
-    }
-    assert.strictEqual(room.state.started, true);
-    assert.strictEqual(room.state.seats.size, 4);
-
-    const spectator = await connectSeat(room, 5, "guest");
-    assert.strictEqual(seatOf(spectator), undefined);
-    assert.strictEqual(spectator.state.seats.get(spectator.sessionId), undefined);
-    assert.strictEqual(room.state.seats.size, 4);
-    assert.strictEqual(room.state.started, true);
-  });
-
-  it("SC-PIECE-05: fourth seat starts the room", async () => {
+  // SC-PIECE-05: Fourth seated player starts the room
+  it("SC-PIECE-05: fourth seated player starts the room", async () => {
     const room = await colyseus.createRoom("tourist", {});
     for (let i = 0; i < 3; i++) {
       await connectSeat(room, i + 1, `p${i + 1}`);
     }
     assert.strictEqual(room.state.started, false);
 
-    await connectSeat(room, 4, "p4");
+    const fourth = await connectSeat(room, 4, "p4");
+    assertFourPiecesOnSides(seatOf(fourth)!);
     assert.strictEqual(room.state.started, true);
     assert.strictEqual(room.state.seats.size, 4);
 
@@ -196,12 +244,33 @@ describe("testing your Colyseus app", () => {
     assert.strictEqual(seatOf(late), undefined);
   });
 
-  it("SC-PIECE-06: leave before start frees pools", async () => {
+  // SC-PIECE-06: Fifth connection is a spectator
+  it("SC-PIECE-06: fifth connection is a spectator", async () => {
+    const room = await colyseus.createRoom("tourist", {});
+    for (let i = 0; i < 4; i++) {
+      await connectSeat(room, i + 1, `p${i + 1}`);
+    }
+    assert.strictEqual(room.state.started, true);
+    assert.strictEqual(room.state.seats.size, 4);
+    const piecesBefore = allRoomPieces(room.state).length;
+
+    const spectator = await connectSeat(room, 5, "guest");
+    assert.strictEqual(seatOf(spectator), undefined);
+    assert.strictEqual(spectator.state.seats.get(spectator.sessionId), undefined);
+    assert.strictEqual(room.state.seats.size, 4);
+    assert.strictEqual(room.state.started, true);
+    assert.strictEqual(allRoomPieces(room.state).length, piecesBefore);
+  });
+
+  // SC-PIECE-07: Leave before start frees kind and cells
+  it("SC-PIECE-07: leave before start frees kind and cells", async () => {
     const room = await colyseus.createRoom("tourist", {});
     const first = await connectSeat(room, 1, "p1");
     const firstSeat = seatOf(first)!;
     const freedId = firstSeat.touristId;
-    const freedSide = firstSeat.side;
+    const freedCells = new Set(
+      listPieces(firstSeat).map((p) => `${p.row},${p.col}`),
+    );
 
     // Keep the room alive while the seated player leaves.
     await connectSeat(room, 2, "holder");
@@ -212,25 +281,28 @@ describe("testing your Colyseus app", () => {
     assert.strictEqual(room.state.seats.has(first.sessionId), false);
     assert.strictEqual(room.state.started, false);
 
-    // Fill remaining seats — freed kind/side must be assignable again.
+    // Fill remaining seats — freed kind/cells must be assignable again.
     const seenIds = new Set<number>();
-    const seenSides = new Set<string>();
+    const seenCells = new Set<string>();
     room.state.seats.forEach((seat: SeatView) => {
       seenIds.add(seat.touristId);
-      seenSides.add(seat.side);
+      listPieces(seat).forEach((p) => seenCells.add(`${p.row},${p.col}`));
     });
     for (let i = 0; i < 3; i++) {
       const c = await connectSeat(room, 10 + i, `reseat${i}`);
       const s = seatOf(c)!;
       seenIds.add(s.touristId);
-      seenSides.add(s.side);
+      listPieces(s).forEach((p) => seenCells.add(`${p.row},${p.col}`));
     }
 
     assert.ok(seenIds.has(freedId), `freed touristId ${freedId} must be reusable`);
-    assert.ok(seenSides.has(freedSide), `freed side ${freedSide} must be reusable`);
+    for (const cell of freedCells) {
+      assert.ok(seenCells.has(cell), `freed cell ${cell} must be reusable`);
+    }
   });
 
-  it("SC-PIECE-07: leave after start does not reopen seating", async () => {
+  // SC-PIECE-08: Leave after start does not reopen seating
+  it("SC-PIECE-08: leave after start does not reopen seating", async () => {
     const room = await colyseus.createRoom("tourist", {});
     const seated = [];
     for (let i = 0; i < 4; i++) {
@@ -240,12 +312,16 @@ describe("testing your Colyseus app", () => {
 
     const leaving = seated[0]!;
     const leavingId = leaving.sessionId;
+    const leavingPieces = listPieces(seatOf(leaving)!);
+    assert.strictEqual(leavingPieces.length, 4);
+
     await leaving.leave();
     await room.waitForNextPatch();
 
     assert.strictEqual(room.state.seats.has(leavingId), false);
     assert.strictEqual(room.state.seats.size, 3);
     assert.strictEqual(room.state.started, true);
+    assert.strictEqual(allRoomPieces(room.state).length, 12);
 
     const late = await connectSeat(room, 99, "spectator");
     assert.strictEqual(seatOf(late), undefined);
