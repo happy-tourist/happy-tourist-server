@@ -8,11 +8,11 @@ Skills and OpenSpec live in **happy-tourist-meta**, not in this package. Before 
 This repository is the server-only package. The sibling browser SPA lives in [`../happy-tourist.github.io`](../happy-tourist.github.io) and connects via WebSocket / HTTP (`VITE_COLYSEUS_URL` / `VITE_API_URL` on the client).
 
 ## What It Is Used For
-Main scenarios (target product; room logic is still a scaffold — see **Current vs client contract**):
+Main scenarios (target product; move rules later — see **Current vs client contract**):
 
 - Register / login / anonymous / Google OAuth auth (`@colyseus/auth` + SQLite user store; callback `…/auth/provider/google/callback`).
 - Create / join tourist rooms; list available rooms for the lobby.
-- Host a `tourist` room for «Счастливый турист» (authoritative rules later); lobby listing works today.
+- Host a `tourist` room for «Счастливый турист» (authoritative seating today; move rules later); lobby listing works today.
 - Persist basic player profile fields (display name, rating, games played/won) on the auth user table.
 - Serve healthchecks and (in non-production) Colyseus Monitor / Playground.
 
@@ -24,7 +24,7 @@ Indirect users (via the client SPA):
 There is no separate admin API or CMS in this package.
 
 ## Important
-This is a realtime game server, not a REST BFF. Authoritative game rules will live here; today the room is a scaffold and the client shows a static board.
+This is a realtime game server, not a REST BFF. Authoritative seating (and later move rules) live here; the client mirrors seats and renders pieces on a local board layout.
 
 Auth to rooms uses JWT (`MyRoom.onAuth` → `JWT.verify`). CORS in production allows `https://happy-tourist.github.io` with credentials; in development any origin is allowed.
 
@@ -37,8 +37,8 @@ The client (`happy-tourist.github.io`) already assumes:
 |--------------------|--------------|
 | Room type name `tourist` | Registered as `tourist` in `app.config.ts` with `.enableRealtimeListing()` |
 | Live lobby (`LobbyRoom`) | `lobby: defineRoom(LobbyRoom)` — client filters `name: tourist` |
-| Static tourist board on Game | Client-only layout; server does not sync tile geometry yet |
-| Synced rules state / game messages | Scaffold `MyRoomState` (`mySynchronizedProperty`); rules later |
+| Tourist board layout on Game | Client-only tile geometry; server does not sync layout |
+| Synced seats / started | `MyRoomState`: `started` + `seats` Map (`touristId`, `side`, `row`, `col`); move messages later |
 | Lobby `GET /rooms/tourist` | Available (HTTP listing); UI uses live LobbyRoom instead |
 
 When implementing the tourist game, prefer aligning room name, schema, and messages with the client rather than changing the client unilaterally.
@@ -92,10 +92,10 @@ See `.env.example`:
 
 ## Rooms
 - `src/app.config.ts` — `lobby` (built-in `LobbyRoom`) + `tourist` (`MyRoom` + `.enableRealtimeListing()`) for live lobby list.
-- `src/rooms/MyRoom.ts` — scaffold room: `onCreate` (minimal `setMetadata` for list) / `onJoin` / `onLeave` / `onDispose` stubs; comments describe intended tourist game flow (`maxClients = 2`, seat colors, disconnect handling).
-- `src/rooms/schema/MyRoomState.ts` — scaffold synced state (`mySynchronizedProperty`).
+- `src/rooms/MyRoom.ts` — `Room<MyRoomState>`: JWT `onAuth`; seat assign/remove in `onJoin`/`onLeave` (≤4 seated, no `maxClients=4`); metadata `status` waiting→playing on fourth seat.
+- `src/rooms/schema/MyRoomState.ts` — product sync: `started` + `seats` Map (`touristId`, `side`, `row`, `col`).
 
-Product room name is `tourist`; fill synced state and messages when board-game rules land.
+Product room name is `tourist`; add move messages when board-game rules land.
 
 ## HTTP Surface
 From `src/app.config.ts` and Colyseus auth:
@@ -171,4 +171,4 @@ Typical Cursor chat workflow: `/opsx-explore` → `/opsx-propose` → artifact r
 Commands (`npm test`, `npm run build`, `npm run dev`, `npm run loadtest`) are run by the **agent** from this package root. Do not wait for user confirmation; fix failures before claiming done.
 
 ## Related Package
-- [`../happy-tourist.github.io`](../happy-tourist.github.io) — Vue 3 + Quasar SPA (GitHub Pages). Prefer changing room names, state schema, and move protocol in coordination with the client; the client assumes room type `tourist` and a static Game board until rules land.
+- [`../happy-tourist.github.io`](../happy-tourist.github.io) — Vue 3 + Quasar SPA (GitHub Pages). Prefer changing room names, state schema, and move protocol in coordination with the client; the client assumes room type `tourist`, mirrors seats/`started`, and renders pieces until move rules land.
