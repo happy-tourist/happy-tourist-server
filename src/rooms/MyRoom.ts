@@ -14,6 +14,17 @@ export type { BoardSide };
 /** Unexpected disconnect grace (seconds) before permanent seat remove. */
 export const RECONNECT_GRACE_SECONDS = 30;
 
+/** Live say bubble lifetime (ms) — server clock + `at`. */
+export const SAY_TTL_MS = 10_000;
+
+/** Max concurrent live says per sessionId. */
+export const SAY_MAX_LIVE = 3;
+
+const SAY_PRESETS: ReadonlySet<string> = new Set(["hello", "luck"]);
+type SayPresetId = "hello" | "luck";
+
+type LiveSay = { sessionId: string; at: number };
+
 const TOURIST_IDS = [1, 2, 3, 4] as const;
 const SIDES: BoardSide[] = ["N", "E", "S", "W"];
 
@@ -56,11 +67,14 @@ function cellKey(row: number, col: number): string {
 /**
  * Комната `tourist`: до 4 seated — у каждого 4 фигурки (N/E/S/W);
  * старт на 4-й seat. Unexpected drop → grace 30 с + reconnect; consented leave → сразу remove.
- * Очередь хода + message `move` — authoritative one-step.
+ * Очередь хода + message `move` — authoritative one-step; `say` — ephemeral preset broadcast.
  */
 export class MyRoom extends Room<{ state: MyRoomState }> {
   /** Join-order queue of seated sessionIds (room-private; not synced). */
   private turnOrder: string[] = [];
+
+  /** Room-private live says `{ sessionId, at }[]` (not schema); pruned by SAY_TTL_MS. */
+  private liveSays: LiveSay[] = [];
 
   /**
    * Проверка JWT-токена перед допуском игрока в комнату.
@@ -80,6 +94,10 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
 
     this.onMessage("move", (client, message) => {
       this.handleMove(client, message);
+    });
+
+    this.onMessage("say", (client, message) => {
+      this.handleSay(client, message);
     });
   }
 
@@ -305,5 +323,53 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
     piece.row = intent.row;
     piece.col = intent.col;
     this.advanceTurn();
+  }
+
+  private parseSayPreset(message: unknown): SayPresetId | null {
+    if (!message || typeof message !== "object") {
+      return null;
+    }
+    const presetId = (message as Record<string, unknown>).presetId;
+    if (typeof presetId !== "string" || !SAY_PRESETS.has(presetId)) {
+      return null;
+    }
+    return presetId as SayPresetId;
+  }
+
+  private pruneLiveSays(now: number) {
+    this.liveSays = this.liveSays.filter((s) => now - s.at < SAY_TTL_MS);
+  }
+
+  private countLiveSaysFor(sessionId: string, now: number): number {
+    this.pruneLiveSays(now);
+    return this.liveSays.filter((s) => s.sessionId === sessionId).length;
+  }
+
+  /**
+   * Whitelist preset say: seated + connected only; max SAY_MAX_LIVE live / SAY_TTL_MS.
+   * Silent reject otherwise (no schema mutate). Broadcast to all room clients.
+   */
+  private handleSay(client: Client, message: unknown) {
+    const seat = this.state.seats.get(client.sessionId);
+    if (!seat || !seat.connected) {
+      return;
+    }
+
+    const presetId = this.parseSayPreset(message);
+    if (!presetId) {
+      return;
+    }
+
+    const now = Date.now();
+    if (this.countLiveSaysFor(client.sessionId, now) >= SAY_MAX_LIVE) {
+      return;
+    }
+
+    this.liveSays.push({ sessionId: client.sessionId, at: now });
+    this.broadcast("say", {
+      sessionId: client.sessionId,
+      presetId,
+      at: now,
+    });
   }
 }

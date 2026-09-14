@@ -12,7 +12,7 @@ Main scenarios (target product; see **Current vs client contract**):
 
 - Register / login / anonymous / Google OAuth auth (`@colyseus/auth` + SQLite user store; callback `…/auth/provider/google/callback`).
 - Create / join tourist rooms; list available rooms for the lobby.
-- Host a `tourist` room for «Счастливый турист» (authoritative seating, turn order, one-step `move`); lobby listing works today.
+- Host a `tourist` room for «Счастливый турист» (authoritative seating, turn order, one-step `move`, ephemeral preset `say`); lobby listing works today.
 - Persist basic player profile fields (display name, rating, games played/won) on the auth user table.
 - Serve healthchecks and (in non-production) Colyseus Monitor / Playground.
 
@@ -40,6 +40,7 @@ The client (`happy-tourist.github.io`) already assumes:
 | Tourist board layout on Game | Client-only tile geometry; server does not sync layout |
 | Synced seats / started / turn / connectivity | `MyRoomState`: `started` + `seats` Map (`touristId` + `pieces` + `connected` / `reconnectUntil`) + `currentTurnSessionId` |
 | Move message | `onMessage('move')` `{ side, row, col }`; pure rules in `src/game/touristMove.ts` |
+| Say message | `onMessage('say')` `{ presetId: 'hello'\|'luck' }` → `broadcast('say', { sessionId, presetId, at })`; max 3 live / 10s; not schema |
 | Tourist reconnect grace (30 s) | `onDrop` → `allowReconnection`; `onReconnect` restores seat; LobbyRoom has no grace |
 | Lobby `GET /rooms/tourist` | Available (HTTP listing); UI uses live LobbyRoom instead |
 
@@ -94,7 +95,7 @@ See `.env.example`:
 
 ## Rooms
 - `src/app.config.ts` — `lobby` (built-in `LobbyRoom`) + `tourist` (`MyRoom` + `.enableRealtimeListing()`) for live lobby list.
-- `src/rooms/MyRoom.ts` — `Room<MyRoomState>`: JWT `onAuth`; seat assign; `turnOrder` + `onMessage('move')`; unexpected drop → 30 s grace + `allowReconnection`; consented leave → immediate remove; empty seated → `disconnect()` (≤4 seated, no `maxClients=4`); metadata `status` waiting→playing on fourth seat.
+- `src/rooms/MyRoom.ts` — `Room<MyRoomState>`: JWT `onAuth`; seat assign; `turnOrder` + `onMessage('move')`; `onMessage('say')` whitelist broadcast; unexpected drop → 30 s grace + `allowReconnection`; consented leave → immediate remove; empty seated → `disconnect()` (≤4 seated, no `maxClients=4`); metadata `status` waiting→playing on fourth seat.
 - `src/rooms/schema/MyRoomState.ts` — product sync: `started` + `seats` Map (`touristId` + four `pieces` keyed by side + `connected` / `reconnectUntil`) + `currentTurnSessionId`.
 - `src/game/touristMove.ts` — pure one-step validate/apply (playable cells, Chebyshev, occupancy).
 

@@ -5,6 +5,7 @@ import { JWT } from "@colyseus/auth";
 import appConfig from "../src/app.config.js";
 import {
   RECONNECT_GRACE_SECONDS,
+  SAY_TTL_MS,
   type BoardSide,
 } from "../src/rooms/MyRoom.js";
 
@@ -840,5 +841,172 @@ describe("testing your Colyseus app", () => {
 
     assert.deepStrictEqual(snapshotPieces(room.state), before);
     assert.strictEqual(room.state.currentTurnSessionId, turnBefore);
+  });
+
+  // --- game/say (SC-SAY-01…06, SC-SAY-10) ---
+
+  type SayEvent = { sessionId: string; presetId: string; at: number };
+
+  function assertSayEvent(ev: SayEvent, sessionId: string, presetId: string) {
+    assert.strictEqual(ev.sessionId, sessionId);
+    assert.strictEqual(ev.presetId, presetId);
+    assert.ok(typeof ev.at === "number" && ev.at > 0);
+  }
+
+  // SC-SAY-01: Known preset is accepted
+  it("SC-SAY-01: known preset is accepted and broadcast", async () => {
+    const room = await colyseus.createRoom("tourist", {});
+    const sender = await connectSeat(room, 1, "sayer");
+    const observer = await connectSeat(room, 2, "observer");
+    await room.waitForNextPatch();
+
+    const gotSender = sender.waitForMessage("say", 2000);
+    const gotObserver = observer.waitForMessage("say", 2000);
+    sender.send("say", { presetId: "hello" });
+
+    const evSender = (await gotSender) as SayEvent;
+    const evObserver = (await gotObserver) as SayEvent;
+    assertSayEvent(evSender, sender.sessionId, "hello");
+    assertSayEvent(evObserver, sender.sessionId, "hello");
+    assert.strictEqual(evSender.at, evObserver.at);
+  });
+
+  // SC-SAY-02: Non-whitelist payload is rejected
+  it("SC-SAY-02: non-whitelist payload is rejected without broadcast", async () => {
+    const room = await colyseus.createRoom("tourist", {});
+    const sender = await connectSeat(room, 1, "sayer");
+    const observer = await connectSeat(room, 2, "observer");
+    await room.waitForNextPatch();
+
+    let observerSaw = false;
+    observer.onMessage("say", () => {
+      observerSaw = true;
+    });
+
+    sender.send("say", { presetId: "unknown" });
+    sender.send("say", { text: "Всем привет" });
+    sender.send("say", { presetId: 123 });
+    sender.send("say", "hello");
+    await new Promise((r) => setTimeout(r, 80));
+
+    assert.strictEqual(observerSaw, false);
+  });
+
+  // SC-SAY-03: Seated connected player may say off-turn
+  it("SC-SAY-03: seated connected player may say off-turn", async () => {
+    const room = await colyseus.createRoom("tourist", {});
+    const c1 = await connectSeat(room, 1, "p1");
+    const c2 = await connectSeat(room, 2, "p2");
+    await room.waitForNextPatch();
+    assert.strictEqual(room.state.currentTurnSessionId, c1.sessionId);
+    assert.notStrictEqual(room.state.currentTurnSessionId, c2.sessionId);
+
+    const got = c1.waitForMessage("say", 2000);
+    c2.send("say", { presetId: "luck" });
+    const ev = (await got) as SayEvent;
+    assertSayEvent(ev, c2.sessionId, "luck");
+  });
+
+  // SC-SAY-04: Spectator cannot say
+  it("SC-SAY-04: spectator cannot say", async () => {
+    const room = await colyseus.createRoom("tourist", {});
+    const seated: Awaited<ReturnType<typeof connectSeat>>[] = [];
+    for (let i = 0; i < 4; i++) {
+      seated.push(await connectSeat(room, i + 1, `p${i + 1}`));
+    }
+    const spectator = await connectSeat(room, 5, "guest");
+    await room.waitForNextPatch();
+    assert.strictEqual(seatOf(spectator), undefined);
+
+    let seatedSaw = false;
+    seated[0]!.onMessage("say", () => {
+      seatedSaw = true;
+    });
+
+    spectator.send("say", { presetId: "hello" });
+    await new Promise((r) => setTimeout(r, 80));
+
+    assert.strictEqual(seatedSaw, false);
+  });
+
+  // SC-SAY-05: Offline grace seat cannot say
+  it("SC-SAY-05: offline grace seat cannot say", async () => {
+    const room = await colyseus.createRoom("tourist", {});
+    const sender = await connectSeat(room, 1, "sayer");
+    const observer = await connectSeat(room, 2, "observer");
+    await room.waitForNextPatch();
+
+    const seat = room.state.seats.get(sender.sessionId);
+    assert.ok(seat);
+    seat.connected = false;
+    seat.reconnectUntil = Date.now() + RECONNECT_GRACE_SECONDS * 1000;
+    await room.waitForNextPatch();
+
+    let observerSaw = false;
+    observer.onMessage("say", () => {
+      observerSaw = true;
+    });
+
+    sender.send("say", { presetId: "hello" });
+    await new Promise((r) => setTimeout(r, 80));
+
+    assert.strictEqual(observerSaw, false);
+  });
+
+  // SC-SAY-06: Spectators see seated player say
+  it("SC-SAY-06: spectators see seated player say", async () => {
+    const room = await colyseus.createRoom("tourist", {});
+    const seatedClients: Awaited<ReturnType<typeof connectSeat>>[] = [];
+    for (let i = 0; i < 4; i++) {
+      seatedClients.push(await connectSeat(room, i + 1, `p${i + 1}`));
+    }
+    const spectator = await connectSeat(room, 5, "guest");
+    await room.waitForNextPatch();
+    assert.strictEqual(seatOf(spectator), undefined);
+
+    const sender = seatedClients[0]!;
+    const otherSeated = seatedClients[1]!;
+
+    const gotSpectator = spectator.waitForMessage("say", 2000);
+    const gotSeated = otherSeated.waitForMessage("say", 2000);
+    sender.send("say", { presetId: "luck" });
+
+    const evSpectator = (await gotSpectator) as SayEvent;
+    const evSeated = (await gotSeated) as SayEvent;
+    assertSayEvent(evSpectator, sender.sessionId, "luck");
+    assertSayEvent(evSeated, sender.sessionId, "luck");
+    assert.strictEqual(evSpectator.at, evSeated.at);
+  });
+
+  // SC-SAY-10: Fourth concurrent say is rejected; after TTL may send again
+  it("SC-SAY-10: fourth concurrent say is rejected; after TTL may send again", async function () {
+    this.timeout(SAY_TTL_MS + 5000);
+
+    const room = await colyseus.createRoom("tourist", {});
+    const sender = await connectSeat(room, 1, "sayer");
+    const observer = await connectSeat(room, 2, "observer");
+    await room.waitForNextPatch();
+
+    const received: SayEvent[] = [];
+    observer.onMessage("say", (msg: SayEvent) => {
+      received.push(msg);
+    });
+
+    sender.send("say", { presetId: "hello" });
+    sender.send("say", { presetId: "luck" });
+    sender.send("say", { presetId: "hello" });
+    await new Promise((r) => setTimeout(r, 100));
+    assert.strictEqual(received.length, 3);
+
+    sender.send("say", { presetId: "luck" });
+    await new Promise((r) => setTimeout(r, 80));
+    assert.strictEqual(received.length, 3, "fourth concurrent say must be rejected");
+
+    await new Promise((r) => setTimeout(r, SAY_TTL_MS + 200));
+
+    const gotAgain = observer.waitForMessage("say", 2000);
+    sender.send("say", { presetId: "hello" });
+    const ev = (await gotAgain) as SayEvent;
+    assertSayEvent(ev, sender.sessionId, "hello");
   });
 });
