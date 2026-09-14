@@ -15,7 +15,7 @@
     "build": "npm run clean && tsc -p tsconfig.build.json",
     "clean": "rimraf build",
     "test": "mocha -r tsx test/**.test.ts --exit --timeout 15000",
-    "loadtest": "tsx loadtest/example.ts --room checkers --numClients 2"
+    "loadtest": "tsx loadtest/example.ts --room tourist --numClients 2"
   },
   "author": "Happy Tourist",
   "license": "UNLICENSED",

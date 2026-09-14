@@ -37,7 +37,7 @@ const server = defineServer({
 
   rooms: {
     lobby: defineRoom(LobbyRoom),
-    checkers: defineRoom(MyRoom).enableRealtimeListing(),
+    tourist: defineRoom(MyRoom).enableRealtimeListing(),
   },
 
   routes: createRouter({

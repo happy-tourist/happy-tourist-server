@@ -18,37 +18,37 @@ describe("testing your Colyseus app", () => {
     const token = await JWT.sign({ id: 1, username: "test" });
     colyseus.sdk.auth.token = token;
 
-    const room = await colyseus.createRoom("checkers", {});
+    const room = await colyseus.createRoom("tourist", {});
     const client1 = await colyseus.connectTo(room);
 
     assert.strictEqual(client1.sessionId, room.clients[0].sessionId);
   });
 
   // SC-LOBBY-02: Room appears in listing
-  it("SC-LOBBY-02: lobby client receives + when checkers room is created", async () => {
+  it("SC-LOBBY-02: lobby client receives + when tourist room is created", async () => {
     const lobby = await colyseus.sdk.joinOrCreate("lobby", {
-      filter: { name: "checkers" },
+      filter: { name: "tourist" },
     });
 
     const added = lobby.waitForMessage("+", 5000);
-    const room = await colyseus.createRoom("checkers", {});
+    const room = await colyseus.createRoom("tourist", {});
     const [roomId, roomData] = await added;
 
     assert.strictEqual(roomId, room.roomId);
-    assert.strictEqual(roomData.name, "checkers");
+    assert.strictEqual(roomData.name, "tourist");
     assert.strictEqual(roomData.metadata?.status, "waiting");
 
     await lobby.leave();
   });
 
   // SC-LOBBY-03: Room leaves listing
-  it("SC-LOBBY-03: lobby client receives - when checkers room is disposed", async () => {
+  it("SC-LOBBY-03: lobby client receives - when tourist room is disposed", async () => {
     const lobby = await colyseus.sdk.joinOrCreate("lobby", {
-      filter: { name: "checkers" },
+      filter: { name: "tourist" },
     });
 
     const added = lobby.waitForMessage("+", 5000);
-    const room = await colyseus.createRoom("checkers", {});
+    const room = await colyseus.createRoom("tourist", {});
     const [roomId] = await added;
     assert.strictEqual(roomId, room.roomId);
 

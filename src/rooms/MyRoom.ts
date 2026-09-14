@@ -2,9 +2,8 @@ import { Room, Client } from "colyseus";
 import { JWT } from "@colyseus/auth";
 
 /**
- * Базовая комната-заготовка.
- * Здесь вы будете реализовывать логику шашек:
- * состояние доски, ходы, проверка правил, синхронизация.
+ * Базовая комната-заготовка для настольной игры «Счастливый турист».
+ * Правила / авторитетное состояние поля — later.
  */
 export class MyRoom extends Room {
   /**
@@ -20,13 +19,13 @@ export class MyRoom extends Room {
   onCreate(_options: any) {
     console.log("[MyRoom] комната создана");
     // Минимальные поля для live lobby list (LobbyPage: metadata.title / status).
-    this.setMetadata({ title: "Checkers", status: "waiting" });
-    // Здесь: инициализация состояния доски, установка maxClients = 2 и т.д.
+    this.setMetadata({ title: "Tourist", status: "waiting" });
+    // Здесь: инициализация состояния, установка maxClients и т.д.
   }
 
   onJoin(client: Client, _options: any, auth: any) {
     console.log(`[MyRoom] игрок вошёл: ${client.sessionId}`, auth);
-    // Здесь: посадить игрока за доску (белые/чёрные)
+    // Здесь: посадить игрока / назначить место
   }
 
   onLeave(client: Client, _code?: number) {

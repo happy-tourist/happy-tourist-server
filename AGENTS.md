@@ -3,7 +3,7 @@ Before work: local [`project-map.md`](project-map.md) (key `happy-tourist-meta` 
 Skills and OpenSpec live in **happy-tourist-meta**, not in this package. Before choosing a skill: [`happy-tourist-meta/.agents/skills/server/`](../happy-tourist-meta/.agents/skills/server/) (see [`happy-tourist-meta/.agents/AGENTS.md`](../happy-tourist-meta/.agents/AGENTS.md)).
 
 ## What This Application Is
-`happy-tourist-server` is the Colyseus multiplayer backend for online checkers (шашки). It authenticates players (email/password, anonymous, and Google OAuth via `@colyseus/auth` `addProvider('google')` in `src/config/auth.ts`), hosts realtime game rooms, syncs board state to clients, and exposes a small HTTP surface (health, demo API, auth routes from Colyseus).
+`happy-tourist-server` is the Colyseus multiplayer backend for online board game «Счастливый турист». It authenticates players (email/password, anonymous, and Google OAuth via `@colyseus/auth` `addProvider('google')` in `src/config/auth.ts`), hosts realtime game rooms, syncs board state to clients, and exposes a small HTTP surface (health, demo API, auth routes from Colyseus).
 
 This repository is the server-only package. The sibling browser SPA lives in [`../happy-tourist.github.io`](../happy-tourist.github.io) and connects via WebSocket / HTTP (`VITE_COLYSEUS_URL` / `VITE_API_URL` on the client).
 
@@ -11,8 +11,8 @@ This repository is the server-only package. The sibling browser SPA lives in [`.
 Main scenarios (target product; room logic is still a scaffold — see **Current vs client contract**):
 
 - Register / login / anonymous / Google OAuth auth (`@colyseus/auth` + SQLite user store; callback `…/auth/provider/google/callback`).
-- Create / join checkers rooms; list available rooms for the lobby.
-- Host a 1v1 russian checkers match with authoritative board state and `move` messages.
+- Create / join tourist rooms; list available rooms for the lobby.
+- Host a `tourist` room for «Счастливый турист» (authoritative rules later); lobby listing works today.
 - Persist basic player profile fields (display name, rating, games played/won) on the auth user table.
 - Serve healthchecks and (in non-production) Colyseus Monitor / Playground.
 
@@ -24,7 +24,7 @@ Indirect users (via the client SPA):
 There is no separate admin API or CMS in this package.
 
 ## Important
-This is a realtime game server, not a REST BFF. Authoritative game rules and board truth live here; the client only renders synced state and sends move intents.
+This is a realtime game server, not a REST BFF. Authoritative game rules will live here; today the room is a scaffold and the client shows a static board.
 
 Auth to rooms uses JWT (`MyRoom.onAuth` → `JWT.verify`). CORS in production allows `https://happy-tourist.github.io` with credentials; in development any origin is allowed.
 
@@ -35,14 +35,13 @@ The client (`happy-tourist.github.io`) already assumes:
 
 | Client expectation | Server today |
 |--------------------|--------------|
-| Room type name `checkers` | Registered as `checkers` in `app.config.ts` with `.enableRealtimeListing()` |
-| Live lobby (`LobbyRoom`) | `lobby: defineRoom(LobbyRoom)` — client filters `name: checkers` |
-| State: `board`, `currentTurn`, `status`, `players[sessionId].color` | Scaffold `MyRoomState` with `mySynchronizedProperty` |
-| Message `move` `{ from, to }` | Not implemented yet |
-| Cell values `0`–`4` (empty / white / black / kings) | Not implemented yet |
-| Lobby `GET /rooms/checkers` | Available (HTTP listing); UI uses live LobbyRoom instead |
+| Room type name `tourist` | Registered as `tourist` in `app.config.ts` with `.enableRealtimeListing()` |
+| Live lobby (`LobbyRoom`) | `lobby: defineRoom(LobbyRoom)` — client filters `name: tourist` |
+| Static tourist board on Game | Client-only layout; server does not sync tile geometry yet |
+| Synced rules state / game messages | Scaffold `MyRoomState` (`mySynchronizedProperty`); rules later |
+| Lobby `GET /rooms/tourist` | Available (HTTP listing); UI uses live LobbyRoom instead |
 
-When implementing checkers, prefer aligning room name, schema, and messages with the client rather than changing the client unilaterally.
+When implementing the tourist game, prefer aligning room name, schema, and messages with the client rather than changing the client unilaterally.
 
 ## Core Stack
 - `colyseus` 0.18 - multiplayer framework (`defineServer` / `defineRoom` via `@colyseus/tools`).
@@ -68,7 +67,7 @@ Application entry: `src/index.ts` → `listen(app)` from `@colyseus/tools`. Pref
 2. `src/index.ts` imports `app.config.ts` and calls `listen(app)` (port `PORT` or `2567`).
 3. `defineServer` wires:
    - `database: db` — enables `@colyseus/auth` HTTP routes + user store;
-   - `rooms` — `lobby` → `LobbyRoom`; `checkers` → `MyRoom.enableRealtimeListing()`;
+   - `rooms` — `lobby` → `LobbyRoom`; `tourist` → `MyRoom.enableRealtimeListing()`;
    - `routes` — custom HTTP endpoints (`/api/hello`, `GET|POST /api/theme`);
    - `express(app)` — CORS, `/health`, `/hi`, and (non-prod) `/monitor` + playground.
 
@@ -92,11 +91,11 @@ See `.env.example`:
 - Room gate: `MyRoom.onAuth` verifies JWT and returns userdata to `onJoin` (same for email / anonymous / Google JWT).
 
 ## Rooms
-- `src/app.config.ts` — `lobby` (built-in `LobbyRoom`) + `checkers` (`MyRoom` + `.enableRealtimeListing()`) for live lobby list.
-- `src/rooms/MyRoom.ts` — scaffold room: `onCreate` (minimal `setMetadata` for list) / `onJoin` / `onLeave` / `onDispose` stubs; comments describe intended checkers flow (`maxClients = 2`, seat colors, disconnect handling).
+- `src/app.config.ts` — `lobby` (built-in `LobbyRoom`) + `tourist` (`MyRoom` + `.enableRealtimeListing()`) for live lobby list.
+- `src/rooms/MyRoom.ts` — scaffold room: `onCreate` (minimal `setMetadata` for list) / `onJoin` / `onLeave` / `onDispose` stubs; comments describe intended tourist game flow (`maxClients = 2`, seat colors, disconnect handling).
 - `src/rooms/schema/MyRoomState.ts` — scaffold synced state (`mySynchronizedProperty`).
 
-Product room name is `checkers`; fill state board/turn/status/players and `move` to match client.
+Product room name is `tourist`; fill synced state and messages when board-game rules land.
 
 ## HTTP Surface
 From `src/app.config.ts` and Colyseus auth:
@@ -134,15 +133,15 @@ Outside `src`:
 Typical paths:
 
 - HTTP auth → `@colyseus/auth` + `GameDatabase` / `users` schema.
-- Matchmaking → Colyseus `lobby` + `checkers` realtime listing; HTTP `/rooms/:roomName` remains.
-- Gameplay → `Room` handler + schema state → client `onStateChange` / `send('move')`.
+- Matchmaking → Colyseus `lobby` + `tourist` realtime listing; HTTP `/rooms/:roomName` remains.
+- Gameplay (later) → `Room` handler + schema state → client `onStateChange` / game messages.
 
 Keep rules authoritative in the room; do not trust client board state. Prefer extending `users` schema defaults carefully so register/login stay compatible.
 
 ## Tests And Loadtest
-- `test/MyRoom.test.ts` — boots `appConfig`, signs JWT, creates `checkers`, connects client; includes lobby live-list cases (SC-LOBBY-02/03).
+- `test/MyRoom.test.ts` — boots `appConfig`, signs JWT, creates `tourist`, connects client; includes lobby live-list cases (SC-LOBBY-02/03).
 - `test/theme.test.ts` — `POST /api/theme`: unauthenticated/anonymous reject; registered persist + login userdata; `GET /api/theme` after POST with same JWT (SC-THEME-08) and with older session JWT after another device saves (SC-THEME-09).
-- `loadtest/example.ts` — `joinOrCreate` scaffold; `--room checkers` / `--numClients` via npm script.
+- `loadtest/example.ts` — `joinOrCreate` scaffold; `--room tourist` / `--numClients` via npm script.
 
 Update tests when the registered room name, auth contract, or preference HTTP changes.
 
@@ -172,4 +171,4 @@ Typical Cursor chat workflow: `/opsx-explore` → `/opsx-propose` → artifact r
 Commands (`npm test`, `npm run build`, `npm run dev`, `npm run loadtest`) are run by the **agent** from this package root. Do not wait for user confirmation; fix failures before claiming done.
 
 ## Related Package
-- [`../happy-tourist.github.io`](../happy-tourist.github.io) — Vue 3 + Quasar SPA (GitHub Pages). Prefer changing room names, state schema, and move protocol in coordination with the client; the client assumes room type `checkers` and the board/turn/status/players shape described in its `AGENTS.md`.
+- [`../happy-tourist.github.io`](../happy-tourist.github.io) — Vue 3 + Quasar SPA (GitHub Pages). Prefer changing room names, state schema, and move protocol in coordination with the client; the client assumes room type `tourist` and a static Game board until rules land.
