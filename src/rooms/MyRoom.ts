@@ -20,8 +20,11 @@ export const SAY_TTL_MS = 10_000;
 /** Max concurrent live says per sessionId. */
 export const SAY_MAX_LIVE = 3;
 
-const SAY_PRESETS: ReadonlySet<string> = new Set(["hello", "luck"]);
-type SayPresetId = "hello" | "luck";
+/** Authoritative start countdown length (seconds), display 5…1. */
+export const COUNTDOWN_SECONDS = 5;
+
+const SAY_PRESETS: ReadonlySet<string> = new Set(["hello", "luck", "ready"]);
+type SayPresetId = "hello" | "luck" | "ready";
 
 type LiveSay = { sessionId: string; at: number };
 
@@ -64,10 +67,24 @@ function cellKey(row: number, col: number): string {
   return `${row},${col}`;
 }
 
+/** Create options: only 2|3|4; invalid → default 2. */
+function parseMaxSeats(options: unknown): 2 | 3 | 4 {
+  const raw =
+    options && typeof options === "object"
+      ? (options as Record<string, unknown>).maxSeats
+      : undefined;
+  if (raw === 2 || raw === 3 || raw === 4) {
+    return raw;
+  }
+  return 2;
+}
+
 /**
- * Комната `tourist`: до 4 seated — у каждого 4 фигурки (N/E/S/W);
- * старт на 4-й seat. Unexpected drop → grace 30 с + reconnect; consented leave → сразу remove.
- * Очередь хода + message `move` — authoritative one-step; `say` — ephemeral preset broadcast.
+ * Комната `tourist`: seated ≤ maxSeats (2|3|4) — у каждого 4 фигурки (N/E/S/W);
+ * seats открыты в любой фазе пока есть свободный слот; spectator при полном столе.
+ * Waiting → countdown (full table / all ready) → playing; `move` только в playing.
+ * Unexpected drop → grace 30 с + reconnect; consented leave → сразу remove.
+ * Очередь хода + message `move` / `ready` / `say`.
  */
 export class MyRoom extends Room<{ state: MyRoomState }> {
   /** Join-order queue of seated sessionIds (room-private; not synced). */
@@ -75,6 +92,9 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
 
   /** Room-private live says `{ sessionId, at }[]` (not schema); pruned by SAY_TTL_MS. */
   private liveSays: LiveSay[] = [];
+
+  /** Bumps when a new countdown starts so stale ticks are ignored. */
+  private countdownGeneration = 0;
 
   /**
    * Проверка JWT-токена перед допуском игрока в комнату.
@@ -86,11 +106,15 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
     return userdata;
   }
 
-  onCreate(_options: any) {
+  onCreate(options: any) {
     console.log("[MyRoom] комната создана");
     this.setState(new MyRoomState());
-    // Без maxClients=4 — гости могут смотреть; seated ≤ 4 через seats/started.
-    this.setMetadata({ title: "Tourist", status: "waiting" });
+    // Без maxClients — гости могут смотреть; seated ≤ maxSeats через seats.
+    this.state.maxSeats = parseMaxSeats(options);
+    this.state.phase = "waiting";
+    this.state.countdownRemaining = 0;
+    this.state.started = false;
+    this.refreshMetadata();
 
     this.onMessage("move", (client, message) => {
       this.handleMove(client, message);
@@ -99,16 +123,17 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
     this.onMessage("say", (client, message) => {
       this.handleSay(client, message);
     });
+
+    this.onMessage("ready", (client) => {
+      this.handleReady(client);
+    });
   }
 
   onJoin(client: Client, _options: any, auth: any) {
     console.log(`[MyRoom] игрок вошёл: ${client.sessionId}`, auth);
 
-    if (this.state.started) {
-      return;
-    }
-
-    if (this.state.seats.size >= 4) {
+    // Seat while free capacity exists in any phase; full table → spectator.
+    if (this.state.seats.size >= this.state.maxSeats) {
       return;
     }
 
@@ -131,6 +156,7 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
       touristId,
       connected: true,
       reconnectUntil: 0,
+      ready: false,
     });
 
     for (const side of SIDES) {
@@ -151,16 +177,25 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
 
     this.state.seats.set(client.sessionId, seat);
     this.appendTurn(client.sessionId);
+    this.refreshMetadata();
+    this.maybeStartCountdown();
+  }
 
-    if (this.state.seats.size >= 4) {
-      this.state.started = true;
-      this.setMetadata({ title: "Tourist", status: "playing" });
-    }
+  /** Lobby listing: title / status / maxSeats / occupied seats. */
+  private refreshMetadata() {
+    const phase = this.state.phase;
+    const status = phase === "playing" ? "playing" : "waiting";
+    this.setMetadata({
+      title: "Tourist",
+      status,
+      maxSeats: this.state.maxSeats,
+      seats: this.state.seats.size,
+    });
   }
 
   /**
    * Unexpected disconnect: hold seat for RECONNECT_GRACE_SECONDS (spectators — no hold).
-   * Does not change current turn (SC-MOVE-17).
+   * Does not change current turn (SC-MOVE-17). Does not cancel countdown (SC-START-11).
    */
   onDrop(client: Client, _code?: number) {
     console.log(`[MyRoom] игрок отвалился: ${client.sessionId}`);
@@ -190,6 +225,7 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
 
   /**
    * Permanent leave: consented exit, grace timeout, or reconnect denied.
+   * Ready marks of remaining seats are kept; countdown is not cancelled.
    * After last seated remove — dispose even if spectators remain (D4).
    */
   onLeave(client: Client, _code?: number) {
@@ -199,16 +235,20 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
       return;
     }
 
-    // Удаляем seat целиком (все 4 pieces).
-    // До start: kind и клетки снова в пуле.
-    // После start: started остаётся true — новым seats не даём.
+    // Удаляем seat целиком (все 4 pieces). Kind/клетки снова в пуле.
+    // Seats reopen while seats.size < maxSeats in any phase.
     this.state.seats.delete(client.sessionId);
     this.removeFromTurnOrder(client.sessionId);
+    this.refreshMetadata();
 
     if (this.state.seats.size === 0) {
       // Зрители не удерживают комнату.
       void this.disconnect();
+      return;
     }
+
+    // Remaining all-ready (after leave) may start countdown; leave never clears others' ready.
+    this.maybeStartCountdown();
   }
 
   onDispose() {
@@ -296,6 +336,10 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
   }
 
   private handleMove(client: Client, message: unknown) {
+    if (this.state.phase !== "playing") {
+      return; // waiting / countdown — reject, no state change (SC-MOVE-18)
+    }
+
     const seat = this.state.seats.get(client.sessionId);
     if (!seat) {
       return; // spectator — reject, no state change
@@ -356,20 +400,130 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
     }
 
     const presetId = this.parseSayPreset(message);
-    if (!presetId) {
+    if (!presetId || presetId === "ready") {
+      // Readiness preset only via `ready` message (D3) — not raw say.
       return;
     }
 
     const now = Date.now();
-    if (this.countLiveSaysFor(client.sessionId, now) >= SAY_MAX_LIVE) {
+    this.broadcastSay(client.sessionId, presetId, now);
+  }
+
+  /** Ephemeral say broadcast; tracks liveSays for TTL/limit (ready intent bypasses limit). */
+  private broadcastSay(
+    sessionId: string,
+    presetId: SayPresetId,
+    at: number,
+    options?: { bypassLiveLimit?: boolean },
+  ) {
+    if (!options?.bypassLiveLimit) {
+      if (this.countLiveSaysFor(sessionId, at) >= SAY_MAX_LIVE) {
+        return false;
+      }
+    }
+    this.liveSays.push({ sessionId, at });
+    this.broadcast("say", { sessionId, presetId, at });
+    return true;
+  }
+
+  /**
+   * One-shot ready while waiting, ≥2 seated, under maxSeats.
+   * Marks seat.ready + broadcasts readiness say; may trigger countdown.
+   */
+  private handleReady(client: Client) {
+    if (this.state.phase !== "waiting") {
       return;
     }
 
-    this.liveSays.push({ sessionId: client.sessionId, at: now });
-    this.broadcast("say", {
-      sessionId: client.sessionId,
-      presetId,
-      at: now,
+    const seat = this.state.seats.get(client.sessionId);
+    if (!seat || !seat.connected) {
+      return; // spectator / offline
+    }
+
+    const seatedCount = this.state.seats.size;
+    if (seatedCount < 2 || seatedCount >= this.state.maxSeats) {
+      return;
+    }
+
+    if (seat.ready) {
+      return; // one-shot
+    }
+
+    seat.ready = true;
+    // Ready intent must always broadcast readiness (bypass live-say cap).
+    this.broadcastSay(client.sessionId, "ready", Date.now(), {
+      bypassLiveLimit: true,
     });
+    this.maybeStartCountdown();
+  }
+
+  private allSeatedReady(): boolean {
+    if (this.state.seats.size < 2) {
+      return false;
+    }
+    let allReady = true;
+    this.state.seats.forEach((seat) => {
+      if (!seat.ready) {
+        allReady = false;
+      }
+    });
+    return allReady;
+  }
+
+  /**
+   * Enter countdown when table is full, or when ≥2 seated (under max) are all ready.
+   * Leave/drop never cancel an in-progress countdown.
+   */
+  private maybeStartCountdown() {
+    if (this.state.phase !== "waiting") {
+      return;
+    }
+
+    const seated = this.state.seats.size;
+    if (seated < 2) {
+      return;
+    }
+
+    const full = seated >= this.state.maxSeats;
+    if (full || this.allSeatedReady()) {
+      this.beginCountdown();
+    }
+  }
+
+  private beginCountdown() {
+    if (this.state.phase !== "waiting") {
+      return;
+    }
+
+    this.state.phase = "countdown";
+    this.state.countdownRemaining = COUNTDOWN_SECONDS;
+    // Legacy: treat non-waiting as "started" for older readers; playing is authoritative for moves.
+    this.state.started = true;
+    this.refreshMetadata();
+
+    const gen = ++this.countdownGeneration;
+    this.scheduleCountdownTick(gen);
+  }
+
+  private scheduleCountdownTick(gen: number) {
+    this.clock.setTimeout(() => {
+      if (gen !== this.countdownGeneration) {
+        return;
+      }
+      if (this.state.phase !== "countdown") {
+        return;
+      }
+
+      if (this.state.countdownRemaining > 1) {
+        this.state.countdownRemaining -= 1;
+        this.scheduleCountdownTick(gen);
+        return;
+      }
+
+      this.state.countdownRemaining = 0;
+      this.state.phase = "playing";
+      this.state.started = true;
+      this.refreshMetadata();
+    }, 1000);
   }
 }

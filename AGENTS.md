@@ -38,9 +38,9 @@ The client (`happy-tourist.github.io`) already assumes:
 | Room type name `tourist` | Registered as `tourist` in `app.config.ts` with `.enableRealtimeListing()` |
 | Live lobby (`LobbyRoom`) | `lobby: defineRoom(LobbyRoom)` — client filters `name: tourist` |
 | Tourist board layout on Game | Client-only tile geometry; server does not sync layout |
-| Synced seats / started / turn / connectivity | `MyRoomState`: `started` + `seats` Map (`touristId` + `pieces` + `connected` / `reconnectUntil`) + `currentTurnSessionId` |
-| Move message | `onMessage('move')` `{ side, row, col }`; pure rules in `src/game/touristMove.ts` |
-| Say message | `onMessage('say')` `{ presetId: 'hello'\|'luck' }` → `broadcast('say', { sessionId, presetId, at })`; max 3 live / 10s; not schema |
+| Synced seats / phase / turn / connectivity | `MyRoomState`: `phase` + `maxSeats` + `countdownRemaining` + legacy `started` + `seats` Map (`touristId` + `pieces` + `connected` / `reconnectUntil` / `ready`) + `currentTurnSessionId` |
+| Move message | `onMessage('move')` `{ side, row, col }` only when `phase === 'playing'`; pure rules in `src/game/touristMove.ts` |
+| Ready / Say | `onMessage('ready')` → seat.ready + say preset `ready`; `onMessage('say')` `{ presetId: 'hello'\|'luck' }` → broadcast (max 3 live / 10s; not schema); readiness not via raw say |
 | Tourist reconnect grace (30 s) | `onDrop` → `allowReconnection`; `onReconnect` restores seat; LobbyRoom has no grace |
 | Lobby `GET /rooms/tourist` | Available (HTTP listing); UI uses live LobbyRoom instead |
 
@@ -95,8 +95,8 @@ See `.env.example`:
 
 ## Rooms
 - `src/app.config.ts` — `lobby` (built-in `LobbyRoom`) + `tourist` (`MyRoom` + `.enableRealtimeListing()`) for live lobby list.
-- `src/rooms/MyRoom.ts` — `Room<MyRoomState>`: JWT `onAuth`; seat assign; `turnOrder` + `onMessage('move')`; `onMessage('say')` whitelist broadcast; unexpected drop → 30 s grace + `allowReconnection`; consented leave → immediate remove; empty seated → `disconnect()` (≤4 seated, no `maxClients=4`); metadata `status` waiting→playing on fourth seat.
-- `src/rooms/schema/MyRoomState.ts` — product sync: `started` + `seats` Map (`touristId` + four `pieces` keyed by side + `connected` / `reconnectUntil`) + `currentTurnSessionId`.
+- `src/rooms/MyRoom.ts` — `Room<MyRoomState>`: JWT `onAuth`; seat assign ≤ `maxSeats` (any phase); start phases / `onMessage('ready')` / countdown; `turnOrder` + `onMessage('move')` (playing only); `onMessage('say')` whitelist broadcast; unexpected drop → 30 s grace + `allowReconnection`; consented leave → immediate remove; empty seated → `disconnect()` (no `maxClients=maxSeats`); metadata `{ title, status, maxSeats, seats }` via `refreshMetadata`.
+- `src/rooms/schema/MyRoomState.ts` — product sync: `phase` / `maxSeats` / `countdownRemaining` + legacy `started` + `seats` Map (`touristId` + four `pieces` keyed by side + `connected` / `reconnectUntil` / `ready`) + `currentTurnSessionId`.
 - `src/game/touristMove.ts` — pure one-step validate/apply (playable cells, Chebyshev, occupancy).
 
 Product room name is `tourist`; client submits moves via store `sendMove` → `room.send('move', { side, row, col })`.
@@ -177,4 +177,4 @@ Typical Cursor chat workflow: `/opsx-explore` → `/opsx-propose` → artifact r
 Commands (`npm test`, `npm run build`, `npm run dev`, `npm run loadtest`) are run by the **agent** from this package root. Do not wait for user confirmation; fix failures before claiming done.
 
 ## Related Package
-- [`../happy-tourist.github.io`](../happy-tourist.github.io) — Vue 3 + Quasar SPA (GitHub Pages). Prefer changing room names, state schema, and move protocol in coordination with the client; the client assumes room type `tourist`, mirrors seats/`started`/`currentTurnSessionId`/connectivity, renders pieces + presence + local move chrome, persists the tourist reconnection token in `localStorage` (then `reconnect` → `joinById`), and submits `move` via `sendMove`.
+- [`../happy-tourist.github.io`](../happy-tourist.github.io) — Vue 3 + Quasar SPA (GitHub Pages). Prefer changing room names, state schema, and move protocol in coordination with the client; the client assumes room type `tourist`, mirrors seats/`phase`/`maxSeats`/`currentTurnSessionId`/connectivity/`ready`, renders pieces + presence + move chrome only in `playing`, persists the tourist reconnection token in `localStorage` (then `reconnect` → `joinById`), and submits `move` via `sendMove` / `ready` via `sendReady`.
