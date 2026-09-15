@@ -6,6 +6,8 @@ export const Piece = schema(
     side: t.string(), // "N"|"E"|"S"|"W"
     row: t.uint8(),
     col: t.uint8(),
+    /** True after landing on a center cell; off-board for occupancy. */
+    finished: t.boolean().default(false),
   },
   "Piece",
 );
@@ -16,6 +18,7 @@ export type Piece = SchemaType<typeof Piece>;
  * Key of `pieces` map = side letter (N|E|S|W).
  * Connectivity: online by default; offline + reconnectUntil during grace.
  * `ready`: one-shot ready-to-start mark (game/start).
+ * `finishPlace`: 0 = not finished; 1…n after all four pieces finished.
  */
 export const Seat = schema(
   {
@@ -26,6 +29,8 @@ export const Seat = schema(
     reconnectUntil: t.number().default(0),
     /** Ready-to-start while phase is waiting (underfilled table). */
     ready: t.boolean().default(false),
+    /** Finish place; `0` until all four pieces finished. */
+    finishPlace: t.uint8().default(0),
   },
   "Seat",
 );
@@ -50,6 +55,8 @@ export const MyRoomState = schema(
     seats: t.map(Seat), // key = sessionId
     /** sessionId of seated player whose turn it is; `""` if no seated. */
     currentTurnSessionId: t.string().default(""),
+    /** Next finish place to assign (starts at 1; increments on full finish). */
+    nextFinishPlace: t.uint8().default(1),
   },
   "MyRoomState",
 );

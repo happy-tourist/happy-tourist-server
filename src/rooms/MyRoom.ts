@@ -3,6 +3,7 @@ import { JWT } from "@colyseus/auth";
 import { MyRoomState, Seat, Piece } from "./schema/MyRoomState.js";
 import {
   isBoardSide,
+  isCenterCell,
   validateTouristMove,
   type BoardSide,
   type MoveIntent,
@@ -142,7 +143,9 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
     this.state.seats.forEach((seat) => {
       usedIds.add(seat.touristId);
       seat.pieces.forEach((piece) => {
-        occupied.add(cellKey(piece.row, piece.col));
+        if (!piece.finished) {
+          occupied.add(cellKey(piece.row, piece.col));
+        }
       });
     });
 
@@ -157,6 +160,7 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
       connected: true,
       reconnectUntil: 0,
       ready: false,
+      finishPlace: 0,
     });
 
     for (const side of SIDES) {
@@ -171,7 +175,7 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
       occupied.add(cellKey(cell.row, cell.col));
       seat.pieces.set(
         side,
-        new Piece({ side, row: cell.row, col: cell.col }),
+        new Piece({ side, row: cell.row, col: cell.col, finished: false }),
       );
     }
 
@@ -257,8 +261,11 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
 
   private appendTurn(sessionId: string) {
     this.turnOrder.push(sessionId);
-    if (this.turnOrder.length === 1) {
-      this.state.currentTurnSessionId = sessionId;
+    // First seat, or mid-game join while every remaining seat is finished
+    // (currentTurn cleared) — restore an eligible turn without jumping off an
+    // already-eligible current player (SC-MOVE-19 / SC-FINISH-07).
+    if (!this.isEligibleForTurn(this.state.currentTurnSessionId)) {
+      this.state.currentTurnSessionId = this.findEligibleFrom(0);
     }
   }
 
@@ -276,10 +283,31 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
     }
 
     if (wasCurrent) {
-      // Next at the same index (wrap).
-      this.state.currentTurnSessionId =
-        this.turnOrder[idx % this.turnOrder.length]!;
+      // Next at the same index (wrap), skipping finished seats.
+      this.state.currentTurnSessionId = this.findEligibleFrom(idx);
     }
+  }
+
+  /** Seat may hold turn only while finishPlace === 0. */
+  private isEligibleForTurn(sessionId: string): boolean {
+    const seat = this.state.seats.get(sessionId);
+    return !!seat && seat.finishPlace === 0;
+  }
+
+  /** Next eligible sessionId starting at `startIdx` (wrap); `""` if all finished. */
+  private findEligibleFrom(startIdx: number): string {
+    if (this.turnOrder.length === 0) {
+      return "";
+    }
+    const n = this.turnOrder.length;
+    const from = ((startIdx % n) + n) % n;
+    for (let i = 0; i < n; i++) {
+      const id = this.turnOrder[(from + i) % n]!;
+      if (this.isEligibleForTurn(id)) {
+        return id;
+      }
+    }
+    return "";
   }
 
   private advanceTurn() {
@@ -289,16 +317,20 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
     }
     const current = this.state.currentTurnSessionId;
     const idx = this.turnOrder.indexOf(current);
-    const from = idx >= 0 ? idx : 0;
-    this.state.currentTurnSessionId =
-      this.turnOrder[(from + 1) % this.turnOrder.length]!;
+    const from = idx >= 0 ? idx : -1;
+    this.state.currentTurnSessionId = this.findEligibleFrom(from + 1);
   }
 
   private listAllPieces(): PieceSnapshot[] {
     const out: PieceSnapshot[] = [];
     this.state.seats.forEach((seat) => {
       seat.pieces.forEach((p) => {
-        out.push({ side: p.side, row: p.row, col: p.col });
+        out.push({
+          side: p.side,
+          row: p.row,
+          col: p.col,
+          finished: p.finished,
+        });
       });
     });
     return out;
@@ -311,7 +343,12 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
     }
     const out: PieceSnapshot[] = [];
     seat.pieces.forEach((p) => {
-      out.push({ side: p.side, row: p.row, col: p.col });
+      out.push({
+        side: p.side,
+        row: p.row,
+        col: p.col,
+        finished: p.finished,
+      });
     });
     return out;
   }
@@ -344,6 +381,9 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
     if (!seat) {
       return; // spectator — reject, no state change
     }
+    if (seat.finishPlace > 0) {
+      return; // finished seat — no moves (SC-MOVE-23)
+    }
     if (this.state.currentTurnSessionId !== client.sessionId) {
       return; // out of turn
     }
@@ -353,6 +393,11 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
       return;
     }
 
+    const piece = seat.pieces.get(intent.side);
+    if (!piece || piece.finished) {
+      return; // unknown or already finished piece
+    }
+
     const moverPieces = this.listSeatPieces(client.sessionId);
     const allPieces = this.listAllPieces();
     const validation = validateTouristMove(moverPieces, allPieces, intent);
@@ -360,12 +405,23 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
       return;
     }
 
-    const piece = seat.pieces.get(intent.side);
-    if (!piece) {
-      return;
-    }
     piece.row = intent.row;
     piece.col = intent.col;
+
+    if (isCenterCell(intent.row, intent.col)) {
+      piece.finished = true;
+      let finishedCount = 0;
+      seat.pieces.forEach((p) => {
+        if (p.finished) {
+          finishedCount += 1;
+        }
+      });
+      if (finishedCount === 4 && seat.finishPlace === 0) {
+        seat.finishPlace = this.state.nextFinishPlace;
+        this.state.nextFinishPlace += 1;
+      }
+    }
+
     this.advanceTurn();
   }
 

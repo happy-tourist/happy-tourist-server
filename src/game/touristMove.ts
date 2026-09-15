@@ -11,6 +11,8 @@ export type PieceSnapshot = {
   side: string;
   row: number;
   col: number;
+  /** Finished pieces are ignored for board occupancy. */
+  finished?: boolean;
 };
 
 /** Client LAYOUT geometry (10×10); `.` = hole. */
@@ -77,6 +79,7 @@ export type MoveIntent = {
 export type MoveRejectReason =
   | "bad_shape"
   | "unknown_side"
+  | "finished"
   | "not_adjacent"
   | "not_playable"
   | "occupied";
@@ -92,8 +95,8 @@ export function isBoardSide(value: unknown): value is BoardSide {
 }
 
 /**
- * Occupancy of all pieces except the mover’s piece at `exclude`
- * (that cell frees when the piece leaves).
+ * Occupancy of unfinished pieces except the mover’s piece at `exclude`
+ * (that cell frees when the piece leaves). Finished pieces do not occupy.
  */
 export function buildOccupancy(
   allPieces: ReadonlyArray<PieceSnapshot>,
@@ -102,6 +105,9 @@ export function buildOccupancy(
   const set = new Set<string>();
   const excludeKey = exclude ? cellKey(exclude.row, exclude.col) : null;
   for (const p of allPieces) {
+    if (p.finished) {
+      continue;
+    }
     const key = cellKey(p.row, p.col);
     if (excludeKey !== null && key === excludeKey) {
       continue;
@@ -137,6 +143,9 @@ export function validateTouristMove(
   const piece = moverPieces.find((p) => p.side === intent.side);
   if (!piece) {
     return { ok: false, reason: "unknown_side" };
+  }
+  if (piece.finished) {
+    return { ok: false, reason: "finished" };
   }
 
   const from: Cell = { row: piece.row, col: piece.col };

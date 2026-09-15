@@ -43,6 +43,7 @@ type PieceView = {
   side: string;
   row: number;
   col: number;
+  finished?: boolean;
 };
 
 type SeatView = {
@@ -50,6 +51,7 @@ type SeatView = {
   connected?: boolean;
   reconnectUntil?: number;
   ready?: boolean;
+  finishPlace?: number;
   pieces: { forEach: (cb: (p: PieceView, key?: string) => void) => void; size?: number; get?: (k: string) => PieceView | undefined };
 };
 
@@ -602,11 +604,43 @@ describe("testing your Colyseus app", () => {
     piece.col = col;
   }
 
-  function snapshotPieces(state: any): Array<{ side: string; row: number; col: number; sessionId: string }> {
-    const out: Array<{ side: string; row: number; col: number; sessionId: string }> = [];
+  function markPieceFinished(
+    room: { state: any },
+    sessionId: string,
+    side: BoardSide,
+  ) {
+    const piece = room.state.seats.get(sessionId).pieces.get(side);
+    assert.ok(piece, `piece ${side} must exist`);
+    piece.finished = true;
+  }
+
+  function setSeatFinished(
+    room: { state: any },
+    sessionId: string,
+    place: number,
+  ) {
+    const seat = room.state.seats.get(sessionId);
+    assert.ok(seat);
+    for (const side of SIDES) {
+      markPieceFinished(room, sessionId, side);
+    }
+    seat.finishPlace = place;
+    if (place >= room.state.nextFinishPlace) {
+      room.state.nextFinishPlace = place + 1;
+    }
+  }
+
+  function snapshotPieces(state: any): Array<{ side: string; row: number; col: number; sessionId: string; finished?: boolean }> {
+    const out: Array<{ side: string; row: number; col: number; sessionId: string; finished?: boolean }> = [];
     state.seats.forEach((seat: SeatView, sessionId: string) => {
       listPieces(seat).forEach((p) => {
-        out.push({ sessionId, side: p.side, row: p.row, col: p.col });
+        out.push({
+          sessionId,
+          side: p.side,
+          row: p.row,
+          col: p.col,
+          finished: p.finished,
+        });
       });
     });
     return out;
@@ -847,19 +881,301 @@ describe("testing your Colyseus app", () => {
       room.state.seats.get(c1.sessionId).pieces.get("N").col,
       3,
     );
+    assert.strictEqual(
+      room.state.seats.get(c1.sessionId).pieces.get("N").finished,
+      false,
+    );
 
-    // Solo keeps turn — onto center: (3,3) → (4,4)
+    // Solo keeps turn — onto center: (3,3) → (4,4) finishes the piece
     placePiece(room, c1.sessionId, "N", 3, 3);
     c1.send("move", { side: "N", row: 4, col: 4 });
     await room.waitForNextPatch();
+    const finishedN = room.state.seats.get(c1.sessionId).pieces.get("N");
+    assert.strictEqual(finishedN.finished, true);
+    assert.strictEqual(finishedN.row, 4);
+    assert.strictEqual(finishedN.col, 4);
+    assert.strictEqual(room.state.currentTurnSessionId, c1.sessionId);
+  });
+
+  // SC-FINISH-01: Move onto a center cell finishes the piece
+  it("SC-FINISH-01: move onto a center cell finishes the piece", async () => {
+    const room = await colyseus.createRoom("tourist", {});
+    const c1 = await connectSeat(room, 1, "p1");
+    await room.waitForNextPatch();
+    forcePlaying(room);
+    assert.strictEqual(room.state.nextFinishPlace, 1);
+
+    placePiece(room, c1.sessionId, "N", 3, 3);
+    placePiece(room, c1.sessionId, "E", 0, 4);
+    placePiece(room, c1.sessionId, "S", 9, 4);
+    placePiece(room, c1.sessionId, "W", 4, 0);
+
+    c1.send("move", { side: "N", row: 4, col: 4 });
+    await room.waitForNextPatch();
+
+    const piece = room.state.seats.get(c1.sessionId).pieces.get("N");
+    assert.strictEqual(piece.finished, true);
+    assert.strictEqual(room.state.seats.get(c1.sessionId).finishPlace, 0);
+  });
+
+  // SC-FINISH-02: Another piece may reuse the same center cell
+  it("SC-FINISH-02: another piece may reuse the same center cell", async () => {
+    const room = await colyseus.createRoom("tourist", {});
+    const c1 = await connectSeat(room, 1, "p1");
+    await room.waitForNextPatch();
+    forcePlaying(room);
+
+    placePiece(room, c1.sessionId, "N", 3, 3);
+    placePiece(room, c1.sessionId, "E", 3, 4);
+    placePiece(room, c1.sessionId, "S", 9, 4);
+    placePiece(room, c1.sessionId, "W", 4, 0);
+
+    c1.send("move", { side: "N", row: 4, col: 4 });
+    await room.waitForNextPatch();
     assert.strictEqual(
-      room.state.seats.get(c1.sessionId).pieces.get("N").row,
-      4,
+      room.state.seats.get(c1.sessionId).pieces.get("N").finished,
+      true,
+    );
+
+    // Same center cell free for another unfinished piece
+    placePiece(room, c1.sessionId, "E", 3, 4);
+    c1.send("move", { side: "E", row: 4, col: 4 });
+    await room.waitForNextPatch();
+
+    assert.strictEqual(
+      room.state.seats.get(c1.sessionId).pieces.get("N").finished,
+      true,
     );
     assert.strictEqual(
-      room.state.seats.get(c1.sessionId).pieces.get("N").col,
-      4,
+      room.state.seats.get(c1.sessionId).pieces.get("E").finished,
+      true,
     );
+  });
+
+  // SC-FINISH-03: First full finisher gets place one
+  it("SC-FINISH-03: first full finisher gets place one", async () => {
+    const room = await colyseus.createRoom("tourist", {});
+    const c1 = await connectSeat(room, 1, "p1");
+    await room.waitForNextPatch();
+    forcePlaying(room);
+
+    markPieceFinished(room, c1.sessionId, "E");
+    markPieceFinished(room, c1.sessionId, "S");
+    markPieceFinished(room, c1.sessionId, "W");
+    placePiece(room, c1.sessionId, "N", 3, 3);
+
+    c1.send("move", { side: "N", row: 4, col: 4 });
+    await room.waitForNextPatch();
+
+    assert.strictEqual(room.state.seats.get(c1.sessionId).finishPlace, 1);
+    assert.strictEqual(room.state.nextFinishPlace, 2);
+    assert.strictEqual(room.state.seats.has(c1.sessionId), true);
+    assert.strictEqual(room.state.currentTurnSessionId, "");
+  });
+
+  // SC-FINISH-04: Later full finisher gets the next place
+  it("SC-FINISH-04: later full finisher gets the next place", async () => {
+    const room = await colyseus.createRoom("tourist", { maxSeats: 4 });
+    const c1 = await connectSeat(room, 1, "p1");
+    const c2 = await connectSeat(room, 2, "p2");
+    await room.waitForNextPatch();
+    forcePlaying(room);
+
+    setSeatFinished(room, c1.sessionId, 1);
+    room.state.currentTurnSessionId = c2.sessionId;
+
+    markPieceFinished(room, c2.sessionId, "E");
+    markPieceFinished(room, c2.sessionId, "S");
+    markPieceFinished(room, c2.sessionId, "W");
+    placePiece(room, c2.sessionId, "N", 3, 4);
+
+    c2.send("move", { side: "N", row: 4, col: 4 });
+    await room.waitForNextPatch();
+
+    assert.strictEqual(room.state.seats.get(c1.sessionId).finishPlace, 1);
+    assert.strictEqual(room.state.seats.get(c2.sessionId).finishPlace, 2);
+    assert.strictEqual(room.state.nextFinishPlace, 3);
+  });
+
+  // SC-MOVE-21: Finished seats are skipped in turn rotation
+  it("SC-MOVE-21: finished seats are skipped in turn rotation", async () => {
+    const room = await colyseus.createRoom("tourist", { maxSeats: 4 });
+    const a = await connectSeat(room, 1, "a");
+    const b = await connectSeat(room, 2, "b");
+    await room.waitForNextPatch();
+    forcePlaying(room);
+
+    setSeatFinished(room, a.sessionId, 1);
+    room.state.currentTurnSessionId = b.sessionId;
+
+    placePiece(room, b.sessionId, "N", 3, 3);
+    placePiece(room, b.sessionId, "E", 0, 5);
+    placePiece(room, b.sessionId, "S", 9, 5);
+    placePiece(room, b.sessionId, "W", 5, 0);
+
+    b.send("move", { side: "N", row: 3, col: 4 });
+    await room.waitForNextPatch();
+
+    assert.strictEqual(room.state.currentTurnSessionId, b.sessionId);
+  });
+
+  // SC-MOVE-22: Finished offline seat does not hold the turn
+  it("SC-MOVE-22: finished offline seat does not hold the turn", async () => {
+    const room = await colyseus.createRoom("tourist", { maxSeats: 4 });
+    const a = await connectSeat(room, 1, "a");
+    const b = await connectSeat(room, 2, "b");
+    const c = await connectSeat(room, 3, "c");
+    await room.waitForNextPatch();
+    forcePlaying(room);
+
+    setSeatFinished(room, a.sessionId, 1);
+    room.state.currentTurnSessionId = b.sessionId;
+
+    await unexpectedDrop(a);
+    await room.waitForNextPatch();
+    assert.ok(room.state.seats.has(a.sessionId));
+    assert.strictEqual(room.state.seats.get(a.sessionId).connected, false);
+
+    placePiece(room, b.sessionId, "N", 3, 3);
+    placePiece(room, b.sessionId, "E", 0, 5);
+    placePiece(room, b.sessionId, "S", 9, 5);
+    placePiece(room, b.sessionId, "W", 5, 0);
+    placePiece(room, c.sessionId, "N", 0, 4);
+    placePiece(room, c.sessionId, "E", 4, 9);
+    placePiece(room, c.sessionId, "S", 9, 4);
+    placePiece(room, c.sessionId, "W", 4, 0);
+
+    b.send("move", { side: "N", row: 3, col: 4 });
+    await room.waitForNextPatch();
+
+    // Join order A(finished offline) → B → C; after B moves, skip A → C
+    assert.strictEqual(room.state.currentTurnSessionId, c.sessionId);
+  });
+
+  // SC-MOVE-23 / SC-FINISH-06: Finished seat cannot move
+  it("SC-MOVE-23 / SC-FINISH-06: finished seat cannot move", async () => {
+    const room = await colyseus.createRoom("tourist", {});
+    const c1 = await connectSeat(room, 1, "p1");
+    await room.waitForNextPatch();
+    forcePlaying(room);
+
+    setSeatFinished(room, c1.sessionId, 1);
+    room.state.currentTurnSessionId = c1.sessionId;
+
+    placePiece(room, c1.sessionId, "N", 3, 3);
+    const before = snapshotPieces(room.state);
+    const turnBefore = room.state.currentTurnSessionId;
+
+    c1.send("move", { side: "N", row: 3, col: 4 });
+    await new Promise((r) => setTimeout(r, 50));
+
+    assert.deepStrictEqual(snapshotPieces(room.state), before);
+    assert.strictEqual(room.state.currentTurnSessionId, turnBefore);
+  });
+
+  // SC-FINISH-07: Finished seat blocks mid-game seating until leave
+  it("SC-FINISH-07: finished seat blocks mid-game seating until leave", async () => {
+    const room = await colyseus.createRoom("tourist", { maxSeats: 2 });
+    const a = await connectSeat(room, 1, "a");
+    const b = await connectSeat(room, 2, "b");
+    await room.waitForNextPatch();
+    forcePlaying(room);
+
+    setSeatFinished(room, a.sessionId, 1);
+    setSeatFinished(room, b.sessionId, 2);
+    assert.strictEqual(room.state.seats.size, 2);
+
+    const guest = await connectSeat(room, 3, "guest");
+    assert.strictEqual(seatOf(guest), undefined);
+    assert.strictEqual(room.state.seats.size, 2);
+
+    await a.leave();
+    await room.waitForNextPatch();
+    assert.strictEqual(room.state.seats.size, 1);
+
+    const late = await connectSeat(room, 4, "late");
+    assert.ok(seatOf(late), "free seat after finished leave");
+    assertFourPiecesOnSides(seatOf(late)!);
+    assert.strictEqual(room.state.seats.size, 2);
+    // Remaining seat B is finished → current was ""; late must receive turn.
+    assert.strictEqual(room.state.currentTurnSessionId, late.sessionId);
+  });
+
+  // SC-FINISH-08: Dispose only when no seats remain
+  it("SC-FINISH-08: dispose only when no seats remain", async () => {
+    const room = await colyseus.createRoom("tourist", { maxSeats: 2 });
+    const a = await connectSeat(room, 1, "a");
+    const b = await connectSeat(room, 2, "b");
+    await room.waitForNextPatch();
+    forcePlaying(room);
+    setSeatFinished(room, a.sessionId, 1);
+    setSeatFinished(room, b.sessionId, 2);
+
+    const guest = await connectSeat(room, 3, "spectator");
+    assert.strictEqual(seatOf(guest), undefined);
+
+    await b.leave();
+    await room.waitForNextPatch();
+    assert.strictEqual(room.state.seats.size, 1);
+    assert.strictEqual(room.state.seats.get(a.sessionId).finishPlace, 1);
+
+    const leftPromise = new Promise<number>((resolve) => {
+      guest.onLeave((code) => resolve(code));
+    });
+    await a.leave();
+    await leftPromise;
+    assert.strictEqual(room.state.seats.size, 0);
+  });
+
+  // SC-FINISH-11: Finished disconnect keeps seat for grace
+  it("SC-FINISH-11: finished disconnect keeps seat for grace", async () => {
+    const room = await colyseus.createRoom("tourist", {});
+    const finished = await connectSeat(room, 1, "fin");
+    await connectSeat(room, 2, "holder");
+    await room.waitForNextPatch();
+    forcePlaying(room);
+
+    setSeatFinished(room, finished.sessionId, 1);
+    const sessionId = finished.sessionId;
+    const place = room.state.seats.get(sessionId).finishPlace;
+    const touristId = room.state.seats.get(sessionId).touristId;
+
+    const now = Date.now();
+    await unexpectedDrop(finished);
+    await room.waitForNextPatch();
+
+    assert.ok(room.state.seats.has(sessionId));
+    assertOfflineGrace(room.state.seats.get(sessionId), now);
+    assert.strictEqual(room.state.seats.get(sessionId).finishPlace, place);
+    assert.strictEqual(room.state.seats.get(sessionId).touristId, touristId);
+  });
+
+  // SC-PIECE-21: Finished seats counted in occupancy
+  it("SC-PIECE-21: finished seats counted in occupancy", async () => {
+    const room = await colyseus.createRoom("tourist", { maxSeats: 3 });
+    const a = await connectSeat(room, 1, "a");
+    const b = await connectSeat(room, 2, "b");
+    const c = await connectSeat(room, 3, "c");
+    await room.waitForNextPatch();
+    forcePlaying(room);
+
+    setSeatFinished(room, a.sessionId, 1);
+    setSeatFinished(room, b.sessionId, 2);
+    assert.strictEqual(room.state.seats.size, 3);
+
+    const guest = await connectSeat(room, 4, "guest");
+    assert.strictEqual(seatOf(guest), undefined);
+
+    await a.leave();
+    await room.waitForNextPatch();
+    assert.strictEqual(room.state.seats.size, 2);
+
+    const late = await connectSeat(room, 5, "late");
+    assert.ok(seatOf(late));
+    assertFourPiecesOnSides(seatOf(late)!);
+    assert.strictEqual(room.state.seats.size, 3);
+    // keep c non-finished so room stays valid
+    assert.strictEqual(room.state.seats.get(c.sessionId).finishPlace, 0);
   });
 
   // SC-MOVE-09: Move out of turn is rejected
@@ -1104,7 +1420,7 @@ describe("testing your Colyseus app", () => {
     await room.waitForNextPatch();
     assert.strictEqual(room.state.phase, "waiting");
 
-    await connectSeat(room, 3, "p3");
+    const c3 = await connectSeat(room, 3, "p3");
     await room.waitForNextPatch();
     assert.strictEqual(room.state.phase, "countdown");
     assert.strictEqual(room.state.countdownRemaining, COUNTDOWN_SECONDS);
@@ -1112,9 +1428,17 @@ describe("testing your Colyseus app", () => {
     assert.strictEqual(c2.state.countdownRemaining, COUNTDOWN_SECONDS);
 
     const seen = new Set<number>();
-    const deadline = Date.now() + COUNTDOWN_SECONDS * 1000 + 2000;
+    const deadline = Date.now() + COUNTDOWN_SECONDS * 1000 + 5000;
     while (room.state.phase === "countdown" && Date.now() < deadline) {
       seen.add(room.state.countdownRemaining);
+      await Promise.race([
+        room.waitForNextPatch().catch(() => undefined),
+        new Promise((r) => setTimeout(r, 50)),
+      ]);
+    }
+    await waitForPhase(room, "playing");
+    // Client view may lag one patch behind room.state after countdown ends.
+    while (c1.state.phase !== "playing" && Date.now() < deadline + 2000) {
       await Promise.race([
         room.waitForNextPatch().catch(() => undefined),
         new Promise((r) => setTimeout(r, 50)),
@@ -1137,9 +1461,22 @@ describe("testing your Colyseus app", () => {
     placePiece(room, c2.sessionId, "E", 5, 9);
     placePiece(room, c2.sessionId, "S", 9, 5);
     placePiece(room, c2.sessionId, "W", 5, 0);
+    placePiece(room, c3.sessionId, "N", 0, 6);
+    placePiece(room, c3.sessionId, "E", 6, 9);
+    placePiece(room, c3.sessionId, "S", 9, 6);
+    placePiece(room, c3.sessionId, "W", 6, 0);
 
     c1.send("move", { side: "N", row: 3, col: 4 });
-    await room.waitForNextPatch();
+    const moveDeadline = Date.now() + 2000;
+    while (
+      room.state.seats.get(c1.sessionId).pieces.get("N").col !== 4 &&
+      Date.now() < moveDeadline
+    ) {
+      await Promise.race([
+        room.waitForNextPatch().catch(() => undefined),
+        new Promise((r) => setTimeout(r, 50)),
+      ]);
+    }
     assert.strictEqual(
       room.state.seats.get(c1.sessionId).pieces.get("N").col,
       4,

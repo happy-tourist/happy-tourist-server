@@ -124,4 +124,29 @@ describe("touristMove pure rules", () => {
       null,
     );
   });
+
+  it("occupancy ignores finished pieces so center can be reused", () => {
+    const pieces: PieceSnapshot[] = [
+      { side: "N", row: 4, col: 4, finished: true },
+      { side: "E", row: 3, col: 3 },
+    ];
+    const result = validateTouristMove(
+      [{ side: "E", row: 3, col: 3 }],
+      pieces,
+      { side: "E", row: 4, col: 4 },
+    );
+    assert.strictEqual(result.ok, true);
+  });
+
+  it("rejects move of an already finished piece", () => {
+    const pieces: PieceSnapshot[] = [
+      { side: "N", row: 4, col: 4, finished: true },
+    ];
+    const result = validateTouristMove(pieces, pieces, {
+      side: "N",
+      row: 4,
+      col: 5,
+    });
+    assert.deepStrictEqual(result, { ok: false, reason: "finished" });
+  });
 });

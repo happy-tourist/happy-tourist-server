@@ -24,7 +24,7 @@ Indirect users (via the client SPA):
 There is no separate admin API or CMS in this package.
 
 ## Important
-This is a realtime game server, not a REST BFF. Authoritative seating, reconnect grace, turn order, and one-step move validation live here; the client mirrors seats/connectivity/`currentTurnSessionId` and renders pieces + presence + local move chrome on a local board layout.
+This is a realtime game server, not a REST BFF. Authoritative seating, reconnect grace, turn order (skip finished), center-finish side-effects, and one-step move validation live here; the client mirrors seats/connectivity/`finishPlace`/piece `finished`/`currentTurnSessionId` and renders unfinished pieces + presence + local move chrome on a local board layout.
 
 Auth to rooms uses JWT (`MyRoom.onAuth` → `JWT.verify`). CORS in production allows `https://happy-tourist.github.io` with credentials; in development any origin is allowed.
 
@@ -38,8 +38,8 @@ The client (`happy-tourist.github.io`) already assumes:
 | Room type name `tourist` | Registered as `tourist` in `app.config.ts` with `.enableRealtimeListing()` |
 | Live lobby (`LobbyRoom`) | `lobby: defineRoom(LobbyRoom)` — client filters `name: tourist` |
 | Tourist board layout on Game | Client-only tile geometry; server does not sync layout |
-| Synced seats / phase / turn / connectivity | `MyRoomState`: `phase` + `maxSeats` + `countdownRemaining` + legacy `started` + `seats` Map (`touristId` + `pieces` + `connected` / `reconnectUntil` / `ready`) + `currentTurnSessionId` |
-| Move message | `onMessage('move')` `{ side, row, col }` only when `phase === 'playing'`; pure rules in `src/game/touristMove.ts` |
+| Synced seats / phase / turn / connectivity | `MyRoomState`: `phase` + `maxSeats` + `countdownRemaining` + legacy `started` + `seats` Map (`touristId` + `pieces` (+ `finished`) + `connected` / `reconnectUntil` / `ready` / `finishPlace`) + `currentTurnSessionId` + `nextFinishPlace` |
+| Move message | `onMessage('move')` `{ side, row, col }` only when `phase === 'playing'` and seat not finished; center → finish piece / maybe place; pure rules in `src/game/touristMove.ts` |
 | Ready / Say | `onMessage('ready')` → seat.ready + say preset `ready`; `onMessage('say')` `{ presetId: 'hello'\|'luck' }` → broadcast (max 3 live / 10s; not schema); readiness not via raw say |
 | Tourist reconnect grace (30 s) | `onDrop` → `allowReconnection`; `onReconnect` restores seat; LobbyRoom has no grace |
 | Lobby `GET /rooms/tourist` | Available (HTTP listing); UI uses live LobbyRoom instead |
@@ -95,9 +95,9 @@ See `.env.example`:
 
 ## Rooms
 - `src/app.config.ts` — `lobby` (built-in `LobbyRoom`) + `tourist` (`MyRoom` + `.enableRealtimeListing()`) for live lobby list.
-- `src/rooms/MyRoom.ts` — `Room<MyRoomState>`: JWT `onAuth`; seat assign ≤ `maxSeats` (any phase); start phases / `onMessage('ready')` / countdown; `turnOrder` + `onMessage('move')` (playing only); `onMessage('say')` whitelist broadcast; unexpected drop → 30 s grace + `allowReconnection`; consented leave → immediate remove; empty seated → `disconnect()` (no `maxClients=maxSeats`); metadata `{ title, status, maxSeats, seats }` via `refreshMetadata`.
-- `src/rooms/schema/MyRoomState.ts` — product sync: `phase` / `maxSeats` / `countdownRemaining` + legacy `started` + `seats` Map (`touristId` + four `pieces` keyed by side + `connected` / `reconnectUntil` / `ready`) + `currentTurnSessionId`.
-- `src/game/touristMove.ts` — pure one-step validate/apply (playable cells, Chebyshev, occupancy).
+- `src/rooms/MyRoom.ts` — `Room<MyRoomState>`: JWT `onAuth`; seat assign ≤ `maxSeats` (any phase); start phases / `onMessage('ready')` / countdown; `turnOrder` (skip finished) + `onMessage('move')` (playing + non-finished; center → finish / place); `onMessage('say')` whitelist broadcast; unexpected drop → 30 s grace + `allowReconnection`; consented leave → immediate remove; empty seated → `disconnect()` (no `maxClients=maxSeats`); metadata `{ title, status, maxSeats, seats }` via `refreshMetadata`.
+- `src/rooms/schema/MyRoomState.ts` — product sync: `phase` / `maxSeats` / `countdownRemaining` + legacy `started` + `seats` Map (`touristId` + four `pieces` keyed by side (+ `finished`) + `connected` / `reconnectUntil` / `ready` / `finishPlace`) + `currentTurnSessionId` + `nextFinishPlace`.
+- `src/game/touristMove.ts` — pure one-step validate/apply (playable cells, Chebyshev, occupancy ignores finished).
 
 Product room name is `tourist`; client submits moves via store `sendMove` → `room.send('move', { side, row, col })`.
 
@@ -144,8 +144,8 @@ Typical paths:
 Keep rules authoritative in the room; do not trust client board state. Prefer extending `users` schema defaults carefully so register/login stay compatible.
 
 ## Tests And Loadtest
-- `test/MyRoom.test.ts` — boots `appConfig`, signs JWT, creates `tourist`, connects client; seating SC-PIECE-01…08 + reconnect grace SC-PIECE-11…16; turn/move SC-MOVE-*; lobby live-list cases (SC-LOBBY-02/03).
-- `test/touristMove.test.ts` — pure `validateTouristMove` / playable geometry (no room I/O).
+- `test/MyRoom.test.ts` — boots `appConfig`, signs JWT, creates `tourist`, connects client; seating SC-PIECE-01…08 + reconnect grace SC-PIECE-11…16; turn/move SC-MOVE-*; finish SC-FINISH-*; lobby live-list cases (SC-LOBBY-02/03).
+- `test/touristMove.test.ts` — pure `validateTouristMove` / playable geometry / finished occupancy (no room I/O).
 - `test/theme.test.ts` — `POST /api/theme`: unauthenticated/anonymous reject; registered persist + login userdata; `GET /api/theme` after POST with same JWT (SC-THEME-08) and with older session JWT after another device saves (SC-THEME-09).
 - `loadtest/example.ts` — `joinOrCreate` scaffold; `--room tourist` / `--numClients` via npm script.
 
@@ -177,4 +177,4 @@ Typical Cursor chat workflow: `/opsx-explore` → `/opsx-propose` → artifact r
 Commands (`npm test`, `npm run build`, `npm run dev`, `npm run loadtest`) are run by the **agent** from this package root. Do not wait for user confirmation; fix failures before claiming done.
 
 ## Related Package
-- [`../happy-tourist.github.io`](../happy-tourist.github.io) — Vue 3 + Quasar SPA (GitHub Pages). Prefer changing room names, state schema, and move protocol in coordination with the client; the client assumes room type `tourist`, mirrors seats/`phase`/`maxSeats`/`currentTurnSessionId`/connectivity/`ready`, renders pieces + presence + move chrome only in `playing`, persists the tourist reconnection token in `localStorage` (then `reconnect` → `joinById`), and submits `move` via `sendMove` / `ready` via `sendReady`.
+- [`../happy-tourist.github.io`](../happy-tourist.github.io) — Vue 3 + Quasar SPA (GitHub Pages). Prefer changing room names, state schema, and move protocol in coordination with the client; the client assumes room type `tourist`, mirrors seats/`phase`/`maxSeats`/`currentTurnSessionId`/connectivity/`ready`/`finishPlace`/piece `finished`, renders unfinished pieces + presence place badge + move chrome only in `playing` for non-finished seats, persists the tourist reconnection token in `localStorage` (then `reconnect` → `joinById`), and submits `move` via `sendMove` / `ready` via `sendReady`.
