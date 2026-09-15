@@ -497,8 +497,8 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
 
     this.state.phase = "countdown";
     this.state.countdownRemaining = COUNTDOWN_SECONDS;
-    // Legacy: treat non-waiting as "started" for older readers; playing is authoritative for moves.
-    this.state.started = true;
+    // Legacy `started` mirrors playing only (D1); moves gate on phase === 'playing'.
+    this.state.started = false;
     this.refreshMetadata();
 
     const gen = ++this.countdownGeneration;

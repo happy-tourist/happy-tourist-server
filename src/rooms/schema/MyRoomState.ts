@@ -37,7 +37,7 @@ export type StartPhase = "waiting" | "countdown" | "playing";
 export const MyRoomState = schema(
   {
     /**
-     * Legacy seating/start flag. Prefer `phase === "playing"`.
+     * Legacy flag: mirror of `phase === "playing"` (prefer reading `phase`).
      * Kept for older clients/tests until fully migrated.
      */
     started: t.boolean().default(false),
