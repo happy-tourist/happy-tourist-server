@@ -19,6 +19,7 @@ export type Piece = SchemaType<typeof Piece>;
  * Connectivity: online by default; offline + reconnectUntil during grace.
  * `ready`: one-shot ready-to-start mark (game/start).
  * `finishPlace`: 0 = not finished; 1…n after all four pieces finished.
+ * `timeExpired`: solo budget elapsed; moves rejected; seat stays.
  */
 export const Seat = schema(
   {
@@ -31,6 +32,8 @@ export const Seat = schema(
     ready: t.boolean().default(false),
     /** Finish place; `0` until all four pieces finished. */
     finishPlace: t.uint8().default(0),
+    /** Solo turn budget elapsed; moves rejected until leave. */
+    timeExpired: t.boolean().default(false),
   },
   "Seat",
 );
@@ -57,6 +60,10 @@ export const MyRoomState = schema(
     currentTurnSessionId: t.string().default(""),
     /** Next finish place to assign (starts at 1; increments on full finish). */
     nextFinishPlace: t.uint8().default(1),
+    /** Unix ms turn deadline; `0` = no active turn timer. */
+    turnUntil: t.number().default(0),
+    /** Active turn budget in seconds (60 multi / 300 solo); `0` when none. */
+    turnBudgetSeconds: t.uint16().default(0),
   },
   "MyRoomState",
 );

@@ -7,6 +7,8 @@ import {
   COUNTDOWN_SECONDS,
   RECONNECT_GRACE_SECONDS,
   SAY_TTL_MS,
+  resetTurnBudgets,
+  setTurnBudgetsForTests,
   type BoardSide,
 } from "../src/rooms/MyRoom.js";
 
@@ -52,6 +54,7 @@ type SeatView = {
   reconnectUntil?: number;
   ready?: boolean;
   finishPlace?: number;
+  timeExpired?: boolean;
   pieces: { forEach: (cb: (p: PieceView, key?: string) => void) => void; size?: number; get?: (k: string) => PieceView | undefined };
 };
 
@@ -109,6 +112,27 @@ function assertFourPiecesOnSides(seat: SeatView) {
   }
 }
 
+function assertNoPieces(seat: SeatView) {
+  assert.strictEqual(listPieces(seat).length, 0, "seat must have no pieces yet");
+}
+
+function assertTurnDeadline(
+  room: { state: any },
+  budgetSeconds: number,
+  nowMs = Date.now(),
+  slackMs = 1500,
+) {
+  assert.strictEqual(room.state.turnBudgetSeconds, budgetSeconds);
+  const until = room.state.turnUntil as number;
+  assert.ok(until > nowMs, "turnUntil must be in the future");
+  const delta = until - nowMs;
+  const expected = budgetSeconds * 1000;
+  assert.ok(
+    Math.abs(delta - expected) < slackMs,
+    `turnUntil delta ${delta}ms should be ~${expected}ms`,
+  );
+}
+
 describe("testing your Colyseus app", () => {
   let colyseus: ColyseusTestServer<typeof appConfig>;
 
@@ -116,7 +140,12 @@ describe("testing your Colyseus app", () => {
   after(async () => colyseus.shutdown());
 
   beforeEach(async () => {
+    resetTurnBudgets();
     await colyseus.cleanup();
+  });
+
+  afterEach(() => {
+    resetTurnBudgets();
   });
 
   async function authAs(id: number, username: string) {
@@ -129,11 +158,31 @@ describe("testing your Colyseus app", () => {
     return colyseus.connectTo(room);
   }
 
-  /** Skip authoritative countdown so move tests can assert rules in isolation. */
-  function forcePlaying(room: { state: any }) {
+  /**
+   * Skip authoritative countdown so move tests can assert rules in isolation.
+   * Materializes deferred pieces; clears turn deadline so isolation tests
+   * are not disrupted by the production timer.
+   */
+  function forcePlaying(room: {
+    state: any;
+    materializePiecesForAllSeats?: () => void;
+    clearTurnDeadline?: () => void;
+    countdownGeneration?: number;
+  }) {
+    room.countdownGeneration = (room.countdownGeneration ?? 0) + 1;
+    room.materializePiecesForAllSeats?.();
     room.state.phase = "playing";
     room.state.countdownRemaining = 0;
     room.state.started = true;
+    room.clearTurnDeadline?.();
+  }
+
+  /** Enter playing with a live turn deadline (timer tests). */
+  function forcePlayingWithTimer(room: {
+    state: any;
+    enterPlaying?: () => void;
+  }) {
+    room.enterPlaying?.();
   }
 
   async function waitForPhase(
@@ -203,38 +252,46 @@ describe("testing your Colyseus app", () => {
     await lobby.leave();
   });
 
-  // SC-PIECE-01: First join receives four pieces on all sides
-  it("SC-PIECE-01: first join receives four pieces on all sides", async () => {
-    const room = await colyseus.createRoom("tourist", {});
+  // SC-PIECE-01: First join receives kind without pieces until playing
+  it("SC-PIECE-01: first join receives kind without pieces until playing", async () => {
+    const room = await colyseus.createRoom("tourist", { maxSeats: 4 });
     const client = await connectSeat(room, 1, "p1");
 
     const seat = seatOf(client);
     assert.ok(seat, "seat must be synced for first joiner");
     assert.ok([1, 2, 3, 4].includes(seat.touristId));
-    assertFourPiecesOnSides(seat);
+    assertNoPieces(seat);
     assert.strictEqual(client.state.phase, "waiting");
-    assert.strictEqual(client.state.maxSeats, 2);
+    assert.strictEqual(client.state.maxSeats, 4);
     assert.strictEqual(client.state.started, false);
     assert.strictEqual(room.state.seats.size, 1);
     assert.strictEqual(room.metadata?.seats, 1);
-    assert.strictEqual(room.metadata?.maxSeats, 2);
+    assert.strictEqual(room.metadata?.maxSeats, 4);
+
+    await connectSeat(room, 2, "p2");
+    forcePlaying(room);
+    assertFourPiecesOnSides(room.state.seats.get(client.sessionId));
   });
 
   // SC-PIECE-02: Tourist kinds stay unique among players
   it("SC-PIECE-02: tourist kinds stay unique among players", async () => {
-    const room = await colyseus.createRoom("tourist", {});
+    const room = await colyseus.createRoom("tourist", { maxSeats: 4 });
     const c1 = await connectSeat(room, 1, "p1");
     const c2 = await connectSeat(room, 2, "p2");
 
     const s1 = seatOf(c1)!;
     const s2 = seatOf(c2)!;
     assert.notStrictEqual(s1.touristId, s2.touristId);
-    assertFourPiecesOnSides(s1);
-    assertFourPiecesOnSides(s2);
+    assertNoPieces(s1);
+    assertNoPieces(s2);
 
     const ids: number[] = [];
     room.state.seats.forEach((seat: SeatView) => ids.push(seat.touristId));
     assert.strictEqual(new Set(ids).size, ids.length);
+
+    forcePlaying(room);
+    assertFourPiecesOnSides(room.state.seats.get(c1.sessionId));
+    assertFourPiecesOnSides(room.state.seats.get(c2.sessionId));
   });
 
   // SC-PIECE-03: Start cells lie on the assigned side and stay free
@@ -244,10 +301,11 @@ describe("testing your Colyseus app", () => {
     for (let i = 0; i < 4; i++) {
       clients.push(await connectSeat(room, i + 1, `p${i + 1}`));
     }
+    forcePlaying(room);
 
     const cellKeys = new Set<string>();
     for (const client of clients) {
-      const seat = seatOf(client)!;
+      const seat = room.state.seats.get(client.sessionId);
       assertFourPiecesOnSides(seat);
       for (const piece of listPieces(seat)) {
         const key = `${piece.row},${piece.col}`;
@@ -260,12 +318,13 @@ describe("testing your Colyseus app", () => {
 
   // SC-PIECE-04: Second player uses remaining cells on each side
   it("SC-PIECE-04: second player uses remaining cells on each side", async () => {
-    const room = await colyseus.createRoom("tourist", {});
+    const room = await colyseus.createRoom("tourist", { maxSeats: 4 });
     const c1 = await connectSeat(room, 1, "p1");
     const c2 = await connectSeat(room, 2, "p2");
+    forcePlaying(room);
 
-    const s1 = seatOf(c1)!;
-    const s2 = seatOf(c2)!;
+    const s1 = room.state.seats.get(c1.sessionId);
+    const s2 = room.state.seats.get(c2.sessionId);
     assertFourPiecesOnSides(s1);
     assertFourPiecesOnSides(s2);
 
@@ -303,10 +362,13 @@ describe("testing your Colyseus app", () => {
     assert.strictEqual(room.metadata?.maxSeats, 4);
 
     const fourth = await connectSeat(room, 4, "p4");
-    assertFourPiecesOnSides(seatOf(fourth)!);
+    assert.ok(seatOf(fourth));
+    assert.ok([1, 2, 3, 4].includes(seatOf(fourth)!.touristId));
+    assertNoPieces(seatOf(fourth)!);
     assert.strictEqual(room.state.seats.size, 4);
     assert.strictEqual(room.state.seats.size, room.state.maxSeats);
     assert.strictEqual(room.metadata?.seats, 4);
+    assert.strictEqual(room.state.phase, "countdown");
 
     const late = await connectSeat(room, 5, "late");
     assert.strictEqual(seatOf(late), undefined);
@@ -322,12 +384,38 @@ describe("testing your Colyseus app", () => {
     assert.strictEqual(room.state.seats.size, 4);
     assert.strictEqual(room.state.seats.size, room.state.maxSeats);
     const piecesBefore = allRoomPieces(room.state).length;
+    assert.strictEqual(piecesBefore, 0, "no pieces before playing");
 
     const spectator = await connectSeat(room, 5, "guest");
     assert.strictEqual(seatOf(spectator), undefined);
     assert.strictEqual(spectator.state.seats.get(spectator.sessionId), undefined);
     assert.strictEqual(room.state.seats.size, 4);
     assert.strictEqual(allRoomPieces(room.state).length, piecesBefore);
+  });
+
+  // SC-PIECE-18: Waiting seats receive pieces at playing
+  it("SC-PIECE-18: waiting seats receive pieces at playing", async function () {
+    this.timeout(COUNTDOWN_SECONDS * 1000 + 10000);
+
+    const room = await colyseus.createRoom("tourist", {});
+    const c1 = await connectSeat(room, 1, "p1");
+    const c2 = await connectSeat(room, 2, "p2");
+    await room.waitForNextPatch();
+    assert.strictEqual(room.state.phase, "countdown");
+    assertNoPieces(seatOf(c1)!);
+    assertNoPieces(seatOf(c2)!);
+
+    await waitForPhase(room, "playing");
+    assertFourPiecesOnSides(room.state.seats.get(c1.sessionId));
+    assertFourPiecesOnSides(room.state.seats.get(c2.sessionId));
+
+    const cellKeys = new Set<string>();
+    allRoomPieces(room.state).forEach((p) => {
+      const key = `${p.row},${p.col}`;
+      assert.ok(!cellKeys.has(key), `duplicate cell ${key}`);
+      cellKeys.add(key);
+    });
+    assert.strictEqual(cellKeys.size, 8);
   });
 
   // SC-PIECE-19: Mid-game join takes a free seat
@@ -347,7 +435,7 @@ describe("testing your Colyseus app", () => {
     assert.strictEqual(room.metadata?.seats, 3);
   });
 
-  // SC-PIECE-07: Leave before start frees kind and cells (consented)
+  // SC-PIECE-07: Leave before start frees kind (consented)
   it("SC-PIECE-07: leave before start frees kind and cells", async () => {
     const room = await colyseus.createRoom("tourist", { maxSeats: 4 });
     const first = await connectSeat(room, 1, "p1");
@@ -355,9 +443,7 @@ describe("testing your Colyseus app", () => {
     assert.strictEqual(firstSeat.connected, true);
     assert.strictEqual(firstSeat.reconnectUntil ?? 0, 0);
     const freedId = firstSeat.touristId;
-    const freedCells = new Set(
-      listPieces(firstSeat).map((p) => `${p.row},${p.col}`),
-    );
+    assertNoPieces(firstSeat);
 
     // Keep the room alive while the seated player leaves.
     await connectSeat(room, 2, "holder");
@@ -369,24 +455,27 @@ describe("testing your Colyseus app", () => {
     assert.strictEqual(room.state.phase, "waiting");
     assert.strictEqual(room.metadata?.seats, 1);
 
-    // Fill remaining seats — freed kind/cells must be assignable again.
+    // Fill remaining seats — freed kind must be assignable again.
     const seenIds = new Set<number>();
-    const seenCells = new Set<string>();
     room.state.seats.forEach((seat: SeatView) => {
       seenIds.add(seat.touristId);
-      listPieces(seat).forEach((p) => seenCells.add(`${p.row},${p.col}`));
     });
     for (let i = 0; i < 3; i++) {
       const c = await connectSeat(room, 10 + i, `reseat${i}`);
       const s = seatOf(c)!;
       seenIds.add(s.touristId);
-      listPieces(s).forEach((p) => seenCells.add(`${p.row},${p.col}`));
+      assertNoPieces(s);
     }
 
     assert.ok(seenIds.has(freedId), `freed touristId ${freedId} must be reusable`);
-    for (const cell of freedCells) {
-      assert.ok(seenCells.has(cell), `freed cell ${cell} must be reusable`);
-    }
+    forcePlaying(room);
+    const cellKeys = new Set<string>();
+    allRoomPieces(room.state).forEach((p) => {
+      const key = `${p.row},${p.col}`;
+      assert.ok(!cellKeys.has(key), `duplicate cell ${key}`);
+      cellKeys.add(key);
+    });
+    assert.strictEqual(cellKeys.size, 16);
   });
 
   // SC-PIECE-08: Leave after full table reopens seating while under maxSeats
@@ -397,11 +486,12 @@ describe("testing your Colyseus app", () => {
       seated.push(await connectSeat(room, i + 1, `p${i + 1}`));
     }
     assert.strictEqual(room.state.seats.size, 4);
+    assert.strictEqual(room.state.phase, "countdown");
+    assert.strictEqual(allRoomPieces(room.state).length, 0);
 
     const leaving = seated[0]!;
     const leavingId = leaving.sessionId;
-    const leavingPieces = listPieces(seatOf(leaving)!);
-    assert.strictEqual(leavingPieces.length, 4);
+    assertNoPieces(seatOf(leaving)!);
 
     await leaving.leave(); // consented → immediate seat remove
     await room.waitForNextPatch();
@@ -409,22 +499,23 @@ describe("testing your Colyseus app", () => {
     assert.strictEqual(room.state.seats.has(leavingId), false);
     assert.strictEqual(room.state.seats.size, 3);
     assert.strictEqual(room.metadata?.seats, 3);
-    assert.strictEqual(allRoomPieces(room.state).length, 12);
+    assert.strictEqual(allRoomPieces(room.state).length, 0);
 
     const late = await connectSeat(room, 99, "rejoin");
     assert.ok(seatOf(late), "free seat must reopen after leave");
-    assertFourPiecesOnSides(seatOf(late)!);
+    assertNoPieces(seatOf(late)!);
+    assert.ok([1, 2, 3, 4].includes(seatOf(late)!.touristId));
     assert.strictEqual(room.state.seats.size, 4);
     assert.strictEqual(room.metadata?.seats, 4);
   });
 
   // SC-PIECE-11: Unexpected disconnect before start holds the seat
   it("SC-PIECE-11: unexpected disconnect before start holds the seat", async () => {
-    const room = await colyseus.createRoom("tourist", {});
+    const room = await colyseus.createRoom("tourist", { maxSeats: 4 });
     const first = await connectSeat(room, 1, "p1");
     const observer = await connectSeat(room, 2, "observer");
     const sessionId = first.sessionId;
-    const piecesBefore = listPieces(seatOf(first)!);
+    assertNoPieces(seatOf(first)!);
     assert.strictEqual(seatOf(first)!.connected, true);
 
     const now = Date.now();
@@ -433,8 +524,7 @@ describe("testing your Colyseus app", () => {
 
     assert.ok(room.state.seats.has(sessionId), "seat must remain during grace");
     assert.strictEqual(room.state.seats.size, 2);
-    assertFourPiecesOnSides(room.state.seats.get(sessionId));
-    assert.strictEqual(listPieces(room.state.seats.get(sessionId)).length, piecesBefore.length);
+    assertNoPieces(room.state.seats.get(sessionId));
 
     const held = seatBySession(observer.state, sessionId)!;
     assertOfflineGrace(held, now);
@@ -449,6 +539,7 @@ describe("testing your Colyseus app", () => {
       seated.push(await connectSeat(room, i + 1, `p${i + 1}`));
     }
     assert.strictEqual(room.state.seats.size, 4);
+    assert.strictEqual(room.state.phase, "countdown");
 
     const dropping = seated[0]!;
     const sessionId = dropping.sessionId;
@@ -458,7 +549,7 @@ describe("testing your Colyseus app", () => {
 
     assert.ok(room.state.seats.has(sessionId));
     assert.strictEqual(room.state.seats.size, 4);
-    assertFourPiecesOnSides(room.state.seats.get(sessionId));
+    assertNoPieces(room.state.seats.get(sessionId));
     assertOfflineGrace(room.state.seats.get(sessionId), now);
 
     const late = await connectSeat(room, 99, "spectator");
@@ -468,7 +559,7 @@ describe("testing your Colyseus app", () => {
 
   // SC-PIECE-13: Reconnect within grace restores the same seat
   it("SC-PIECE-13: reconnect within grace restores the same seat", async () => {
-    const room = await colyseus.createRoom("tourist", {});
+    const room = await colyseus.createRoom("tourist", { maxSeats: 4 });
     const first = await connectSeat(room, 1, "p1");
     const observer = await connectSeat(room, 2, "observer");
     const sessionId = first.sessionId;
@@ -489,7 +580,7 @@ describe("testing your Colyseus app", () => {
     assert.strictEqual(seat.touristId, touristId);
     assert.strictEqual(seat.connected, true);
     assert.strictEqual(seat.reconnectUntil, 0);
-    assertFourPiecesOnSides(seat);
+    assertNoPieces(seat);
 
     const observed = seatBySession(observer.state, sessionId)!;
     assert.strictEqual(observed.connected, true);
@@ -505,9 +596,7 @@ describe("testing your Colyseus app", () => {
     await connectSeat(room, 2, "holder");
     const sessionId = first.sessionId;
     const freedId = seatOf(first)!.touristId;
-    const freedCells = new Set(
-      listPieces(seatOf(first)!).map((p) => `${p.row},${p.col}`),
-    );
+    assertNoPieces(seatOf(first)!);
 
     await unexpectedDrop(first);
     await room.waitForNextPatch();
@@ -520,23 +609,18 @@ describe("testing your Colyseus app", () => {
     assert.strictEqual(room.state.phase, "waiting");
     assert.strictEqual(room.metadata?.seats, 1);
 
-    // Freed kind/cells reusable before start.
+    // Freed kind reusable before start.
     const seenIds = new Set<number>();
-    const seenCells = new Set<string>();
     room.state.seats.forEach((seat: SeatView) => {
       seenIds.add(seat.touristId);
-      listPieces(seat).forEach((p) => seenCells.add(`${p.row},${p.col}`));
     });
     for (let i = 0; i < 3; i++) {
       const c = await connectSeat(room, 20 + i, `after-timeout-${i}`);
       const s = seatOf(c)!;
       seenIds.add(s.touristId);
-      listPieces(s).forEach((p) => seenCells.add(`${p.row},${p.col}`));
+      assertNoPieces(s);
     }
     assert.ok(seenIds.has(freedId));
-    for (const cell of freedCells) {
-      assert.ok(seenCells.has(cell));
-    }
   });
 
   // SC-PIECE-15: Last seated removal closes the room with spectators present
@@ -1184,6 +1268,7 @@ describe("testing your Colyseus app", () => {
     const c1 = await connectSeat(room, 1, "p1");
     const c2 = await connectSeat(room, 2, "p2");
     await room.waitForNextPatch();
+    forcePlaying(room);
     assert.strictEqual(room.state.currentTurnSessionId, c1.sessionId);
 
     placePiece(room, c2.sessionId, "N", 3, 3);
@@ -1396,11 +1481,8 @@ describe("testing your Colyseus app", () => {
 
     assert.strictEqual(room.state.phase, "waiting");
     assert.strictEqual(c1.state.phase, "waiting");
-
-    placePiece(room, c1.sessionId, "N", 3, 3);
-    placePiece(room, c1.sessionId, "E", 0, 4);
-    placePiece(room, c1.sessionId, "S", 9, 4);
-    placePiece(room, c1.sessionId, "W", 4, 0);
+    assertNoPieces(seatOf(c1)!);
+    assert.strictEqual(room.state.turnUntil, 0);
 
     const before = snapshotPieces(room.state);
     c1.send("move", { side: "N", row: 3, col: 4 });
@@ -1408,6 +1490,7 @@ describe("testing your Colyseus app", () => {
 
     assert.deepStrictEqual(snapshotPieces(room.state), before);
     assert.strictEqual(room.state.phase, "waiting");
+    assert.strictEqual(room.state.turnUntil, 0);
   });
 
   // SC-START-02 / SC-START-03: Full table countdown → playing unlocks moves
@@ -1451,6 +1534,11 @@ describe("testing your Colyseus app", () => {
     for (let n = 1; n <= COUNTDOWN_SECONDS; n++) {
       assert.ok(seen.has(n), `countdown must observe ${n}`);
     }
+
+    // SC-START-02 / SC-START-13: pieces materialized then moves unlock
+    assertFourPiecesOnSides(room.state.seats.get(c1.sessionId));
+    assertFourPiecesOnSides(room.state.seats.get(c2.sessionId));
+    assertFourPiecesOnSides(room.state.seats.get(c3.sessionId));
 
     // SC-START-02: legal move accepted in playing
     placePiece(room, c1.sessionId, "N", 3, 3);
@@ -1642,19 +1730,20 @@ describe("testing your Colyseus app", () => {
     assert.strictEqual(room.state.phase, "countdown");
 
     const leavingId = c1.sessionId;
-    const piecesBefore = allRoomPieces(room.state).length;
+    assert.strictEqual(allRoomPieces(room.state).length, 0);
     await c1.leave();
     await room.waitForNextPatch();
 
     assert.strictEqual(room.state.seats.has(leavingId), false);
     assert.strictEqual(room.state.seats.size, 1);
-    assert.strictEqual(allRoomPieces(room.state).length, piecesBefore - 4);
+    assert.strictEqual(allRoomPieces(room.state).length, 0);
     assert.strictEqual(room.state.phase, "countdown");
 
     await waitForPhase(room, "playing");
     assert.strictEqual(room.state.phase, "playing");
     assert.strictEqual(c2.state.phase, "playing");
     assert.strictEqual(room.state.seats.size, 1);
+    assertFourPiecesOnSides(room.state.seats.get(c2.sessionId));
   });
 
   // SC-MOVE-18: Move before playing is rejected
@@ -1665,11 +1754,7 @@ describe("testing your Colyseus app", () => {
     await room.waitForNextPatch();
     assert.strictEqual(room.state.phase, "waiting");
     assert.strictEqual(room.state.currentTurnSessionId, c1.sessionId);
-
-    placePiece(room, c1.sessionId, "N", 3, 3);
-    placePiece(room, c1.sessionId, "E", 0, 4);
-    placePiece(room, c1.sessionId, "S", 9, 4);
-    placePiece(room, c1.sessionId, "W", 4, 0);
+    assertNoPieces(seatOf(c1)!);
 
     const before = snapshotPieces(room.state);
     const turnBefore = room.state.currentTurnSessionId;
@@ -1723,5 +1808,206 @@ describe("testing your Colyseus app", () => {
     c2.send("move", { side: "N", row: 2, col: 4 });
     await room.waitForNextPatch();
     assert.strictEqual(room.state.currentTurnSessionId, c3.sessionId);
+  });
+
+  // --- turn timer (SC-MOVE-25…31 server) ---
+
+  async function waitMs(ms: number) {
+    await new Promise((r) => setTimeout(r, ms));
+  }
+
+  // SC-MOVE-25: Sixty-second deadline on each multiplayer turn
+  it("SC-MOVE-25: sixty-second deadline on each multiplayer turn", async () => {
+    setTurnBudgetsForTests(2, 10);
+    const room = await colyseus.createRoom("tourist", { maxSeats: 4 });
+    const c1 = await connectSeat(room, 1, "p1");
+    await connectSeat(room, 2, "p2");
+    await room.waitForNextPatch();
+
+    const now = Date.now();
+    forcePlayingWithTimer(room);
+    await room.waitForNextPatch();
+    assert.strictEqual(room.state.currentTurnSessionId, c1.sessionId);
+    assertTurnDeadline(room, 2, now);
+    assert.strictEqual(room.state.turnBudgetSeconds, 2);
+    assert.ok((room.state.turnUntil as number) > 0);
+
+    // Client observes the same synced deadline
+    const syncDeadline = Date.now() + 2000;
+    while (
+      (c1.state.turnBudgetSeconds ?? 0) !== 2 &&
+      Date.now() < syncDeadline
+    ) {
+      await Promise.race([
+        room.waitForNextPatch().catch(() => undefined),
+        waitMs(50),
+      ]);
+    }
+    assert.strictEqual(c1.state.turnBudgetSeconds, 2);
+    assert.ok((c1.state.turnUntil as number) > 0);
+  });
+
+  // SC-MOVE-26: Deadline ticks during reconnect grace
+  it("SC-MOVE-26: deadline ticks during reconnect grace", async () => {
+    setTurnBudgetsForTests(3, 10);
+    const room = await colyseus.createRoom("tourist", { maxSeats: 4 });
+    const c1 = await connectSeat(room, 1, "p1");
+    await connectSeat(room, 2, "p2");
+    await room.waitForNextPatch();
+    forcePlayingWithTimer(room);
+
+    const untilBefore = room.state.turnUntil as number;
+    assert.ok(untilBefore > Date.now());
+
+    await unexpectedDrop(c1);
+    await room.waitForNextPatch();
+    assert.strictEqual(room.state.currentTurnSessionId, c1.sessionId);
+    assert.strictEqual(room.state.turnUntil, untilBefore);
+    assert.strictEqual(room.state.seats.get(c1.sessionId).connected, false);
+
+    await waitMs(400);
+    assert.strictEqual(room.state.turnUntil, untilBefore);
+    assert.ok(room.state.turnUntil > Date.now(), "deadline still counting down");
+  });
+
+  // SC-MOVE-27: No turn auto-pass before playing
+  it("SC-MOVE-27: no turn auto-pass before playing", async function () {
+    this.timeout(8000);
+    setTurnBudgetsForTests(1, 10);
+
+    const room = await colyseus.createRoom("tourist", { maxSeats: 4 });
+    const c1 = await connectSeat(room, 1, "p1");
+    const c2 = await connectSeat(room, 2, "p2");
+    await room.waitForNextPatch();
+    assert.strictEqual(room.state.phase, "waiting");
+    assert.strictEqual(room.state.currentTurnSessionId, c1.sessionId);
+    assert.strictEqual(room.state.turnUntil, 0);
+
+    await waitMs(1500);
+    assert.strictEqual(room.state.phase, "waiting");
+    assert.strictEqual(room.state.currentTurnSessionId, c1.sessionId);
+    assert.strictEqual(room.state.turnUntil, 0);
+    assert.notStrictEqual(room.state.currentTurnSessionId, c2.sessionId);
+  });
+
+  // SC-MOVE-28: Sixty-second timeout passes the turn
+  it("SC-MOVE-28: sixty-second timeout passes the turn", async function () {
+    this.timeout(10000);
+    setTurnBudgetsForTests(1, 10);
+
+    const room = await colyseus.createRoom("tourist", { maxSeats: 4 });
+    const c1 = await connectSeat(room, 1, "p1");
+    const c2 = await connectSeat(room, 2, "p2");
+    await room.waitForNextPatch();
+    forcePlayingWithTimer(room);
+
+    const piecesBefore = snapshotPieces(room.state);
+    assert.strictEqual(room.state.currentTurnSessionId, c1.sessionId);
+    assertTurnDeadline(room, 1);
+
+    const deadline = Date.now() + 3000;
+    while (
+      room.state.currentTurnSessionId === c1.sessionId &&
+      Date.now() < deadline
+    ) {
+      await Promise.race([
+        room.waitForNextPatch().catch(() => undefined),
+        waitMs(50),
+      ]);
+    }
+
+    assert.strictEqual(room.state.currentTurnSessionId, c2.sessionId);
+    assert.deepStrictEqual(snapshotPieces(room.state), piecesBefore);
+    assertTurnDeadline(room, 1);
+  });
+
+  // SC-MOVE-29: Solo remaining player gets five minutes
+  it("SC-MOVE-29: solo remaining player gets five minutes", async () => {
+    setTurnBudgetsForTests(2, 5);
+    const room = await colyseus.createRoom("tourist", { maxSeats: 4 });
+    const c1 = await connectSeat(room, 1, "p1");
+    const c2 = await connectSeat(room, 2, "p2");
+    await room.waitForNextPatch();
+    forcePlayingWithTimer(room);
+    assertTurnDeadline(room, 2);
+
+    const now = Date.now();
+    setSeatFinished(room, c2.sessionId, 1);
+    // Leaving finished seat creates solo for c1 while they hold turn.
+    await c2.leave();
+    await room.waitForNextPatch();
+
+    assert.strictEqual(room.state.seats.size, 1);
+    assert.strictEqual(room.state.currentTurnSessionId, c1.sessionId);
+    assertTurnDeadline(room, 5, now);
+  });
+
+  // SC-MOVE-30: Successful solo finish clears the deadline
+  it("SC-MOVE-30: successful solo finish clears the deadline", async () => {
+    setTurnBudgetsForTests(2, 8);
+    const room = await colyseus.createRoom("tourist", { maxSeats: 4 });
+    const solo = await connectSeat(room, 1, "solo");
+    await room.waitForNextPatch();
+    forcePlayingWithTimer(room);
+    assertTurnDeadline(room, 8);
+
+    markPieceFinished(room, solo.sessionId, "E");
+    markPieceFinished(room, solo.sessionId, "S");
+    markPieceFinished(room, solo.sessionId, "W");
+    placePiece(room, solo.sessionId, "N", 3, 3);
+
+    solo.send("move", { side: "N", row: 4, col: 4 });
+    await room.waitForNextPatch();
+
+    assert.strictEqual(room.state.seats.get(solo.sessionId).finishPlace, 1);
+    assert.strictEqual(room.state.seats.get(solo.sessionId).timeExpired, false);
+    assert.strictEqual(room.state.turnUntil, 0);
+    assert.strictEqual(room.state.turnBudgetSeconds, 0);
+    assert.strictEqual(room.state.currentTurnSessionId, "");
+  });
+
+  // SC-MOVE-31 (server half): Solo timeout locks moves; room stays
+  it("SC-MOVE-31: solo timeout locks moves and keeps the room", async function () {
+    this.timeout(10000);
+    setTurnBudgetsForTests(2, 1);
+
+    const room = await colyseus.createRoom("tourist", { maxSeats: 2 });
+    const solo = await connectSeat(room, 1, "solo");
+    const finished = await connectSeat(room, 2, "fin");
+    await room.waitForNextPatch();
+    forcePlayingWithTimer(room);
+
+    setSeatFinished(room, finished.sessionId, 1);
+    room.resyncTurnDeadline?.({ preserveSoloBudget: false });
+    assert.strictEqual(room.state.currentTurnSessionId, solo.sessionId);
+    assertTurnDeadline(room, 1);
+
+    const spectator = await connectSeat(room, 3, "spec");
+    assert.strictEqual(seatOf(spectator), undefined);
+
+    const deadline = Date.now() + 3000;
+    while (
+      !room.state.seats.get(solo.sessionId).timeExpired &&
+      Date.now() < deadline
+    ) {
+      await Promise.race([
+        room.waitForNextPatch().catch(() => undefined),
+        waitMs(50),
+      ]);
+    }
+
+    assert.strictEqual(room.state.seats.get(solo.sessionId).timeExpired, true);
+    assert.strictEqual(room.state.turnUntil, 0);
+    assert.strictEqual(room.state.turnBudgetSeconds, 0);
+
+    placePiece(room, solo.sessionId, "N", 3, 3);
+    const afterPlace = snapshotPieces(room.state);
+    solo.send("move", { side: "N", row: 3, col: 4 });
+    await waitMs(80);
+    assert.deepStrictEqual(snapshotPieces(room.state), afterPlace);
+
+    assert.strictEqual(room.state.seats.size, 2);
+    assert.ok(room.state.seats.has(solo.sessionId));
+    assert.strictEqual(seatOf(spectator), undefined);
   });
 });

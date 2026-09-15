@@ -24,6 +24,24 @@ export const SAY_MAX_LIVE = 3;
 /** Authoritative start countdown length (seconds), display 5…1. */
 export const COUNTDOWN_SECONDS = 5;
 
+/** Multiplayer turn budget (seconds). Mutable for mocha acceleration. */
+export let TURN_BUDGET_SECONDS = 60;
+
+/** Solo endgame turn budget (seconds). Mutable for mocha acceleration. */
+export let SOLO_BUDGET_SECONDS = 300;
+
+/** Restore production turn budgets after test overrides. */
+export function resetTurnBudgets() {
+  TURN_BUDGET_SECONDS = 60;
+  SOLO_BUDGET_SECONDS = 300;
+}
+
+/** Override turn budgets for mocha (avoid waiting real 60s/300s). */
+export function setTurnBudgetsForTests(multiSeconds: number, soloSeconds: number) {
+  TURN_BUDGET_SECONDS = multiSeconds;
+  SOLO_BUDGET_SECONDS = soloSeconds;
+}
+
 const SAY_PRESETS: ReadonlySet<string> = new Set(["hello", "luck", "ready"]);
 type SayPresetId = "hello" | "luck" | "ready";
 
@@ -81,9 +99,10 @@ function parseMaxSeats(options: unknown): 2 | 3 | 4 {
 }
 
 /**
- * Комната `tourist`: seated ≤ maxSeats (2|3|4) — у каждого 4 фигурки (N/E/S/W);
- * seats открыты в любой фазе пока есть свободный слот; spectator при полном столе.
+ * Комната `tourist`: seated ≤ maxSeats (2|3|4) — seat+kind сразу;
+ * pieces только в `playing` (materialize на вход / join mid-game).
  * Waiting → countdown (full table / all ready) → playing; `move` только в playing.
+ * Turn deadline 60s (≥2 eligible) / 300s solo; timeout → advance или timeExpired.
  * Unexpected drop → grace 30 с + reconnect; consented leave → сразу remove.
  * Очередь хода + message `move` / `ready` / `say`.
  */
@@ -96,6 +115,9 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
 
   /** Bumps when a new countdown starts so stale ticks are ignored. */
   private countdownGeneration = 0;
+
+  /** Bumps when turn deadline is cleared/rescheduled so stale timeouts are ignored. */
+  private turnTimerGeneration = 0;
 
   /**
    * Проверка JWT-токена перед допуском игрока в комнату.
@@ -115,6 +137,8 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
     this.state.phase = "waiting";
     this.state.countdownRemaining = 0;
     this.state.started = false;
+    this.state.turnUntil = 0;
+    this.state.turnBudgetSeconds = 0;
     this.refreshMetadata();
 
     this.onMessage("move", (client, message) => {
@@ -139,14 +163,8 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
     }
 
     const usedIds = new Set<number>();
-    const occupied = new Set<string>();
     this.state.seats.forEach((seat) => {
       usedIds.add(seat.touristId);
-      seat.pieces.forEach((piece) => {
-        if (!piece.finished) {
-          occupied.add(cellKey(piece.row, piece.col));
-        }
-      });
     });
 
     const availableIds = TOURIST_IDS.filter((id) => !usedIds.has(id));
@@ -161,22 +179,12 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
       reconnectUntil: 0,
       ready: false,
       finishPlace: 0,
+      timeExpired: false,
     });
 
-    for (const side of SIDES) {
-      const free = START_CELLS[side].filter(
-        (c) => !occupied.has(cellKey(c.row, c.col)),
-      );
-      if (free.length === 0) {
-        // Не должно случаться при ≤4 seats и 4 стартах на сторону.
-        return;
-      }
-      const cell = pickUniform(free);
-      occupied.add(cellKey(cell.row, cell.col));
-      seat.pieces.set(
-        side,
-        new Piece({ side, row: cell.row, col: cell.col, finished: false }),
-      );
+    // Pieces only while already playing; waiting/countdown defer until enterPlaying.
+    if (this.state.phase === "playing") {
+      this.assignPiecesToSeat(seat);
     }
 
     this.state.seats.set(client.sessionId, seat);
@@ -200,6 +208,7 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
   /**
    * Unexpected disconnect: hold seat for RECONNECT_GRACE_SECONDS (spectators — no hold).
    * Does not change current turn (SC-MOVE-17). Does not cancel countdown (SC-START-11).
+   * Turn deadline keeps ticking (SC-MOVE-26).
    */
   onDrop(client: Client, _code?: number) {
     console.log(`[MyRoom] игрок отвалился: ${client.sessionId}`);
@@ -256,7 +265,155 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
   }
 
   onDispose() {
+    this.clearTurnDeadline();
     console.log("[MyRoom] комната закрыта");
+  }
+
+  /** Occupied cells of unfinished pieces in the room. */
+  private collectOccupiedCells(): Set<string> {
+    const occupied = new Set<string>();
+    this.state.seats.forEach((seat) => {
+      seat.pieces.forEach((piece) => {
+        if (!piece.finished) {
+          occupied.add(cellKey(piece.row, piece.col));
+        }
+      });
+    });
+    return occupied;
+  }
+
+  /** Place four pieces on free start cells for a seat (mutates `occupied`). */
+  private assignPiecesToSeat(seat: Seat, occupied = this.collectOccupiedCells()) {
+    for (const side of SIDES) {
+      const free = START_CELLS[side].filter(
+        (c) => !occupied.has(cellKey(c.row, c.col)),
+      );
+      if (free.length === 0) {
+        // Не должно случаться при ≤4 seats и 4 стартах на сторону.
+        return;
+      }
+      const cell = pickUniform(free);
+      occupied.add(cellKey(cell.row, cell.col));
+      seat.pieces.set(
+        side,
+        new Piece({ side, row: cell.row, col: cell.col, finished: false }),
+      );
+    }
+  }
+
+  /** Materialize four pieces for every seated player that still has none. */
+  materializePiecesForAllSeats() {
+    const occupied = this.collectOccupiedCells();
+    this.state.seats.forEach((seat) => {
+      if (seat.pieces.size === 0) {
+        this.assignPiecesToSeat(seat, occupied);
+      }
+    });
+  }
+
+  /** Enter playing: materialize deferred pieces and start turn deadline. */
+  enterPlaying() {
+    this.countdownGeneration += 1;
+    this.state.countdownRemaining = 0;
+    this.state.phase = "playing";
+    this.state.started = true;
+    this.materializePiecesForAllSeats();
+    this.refreshMetadata();
+    this.resyncTurnDeadline();
+  }
+
+  /** Clear synced deadline + cancel pending turn timeout. */
+  clearTurnDeadline() {
+    this.turnTimerGeneration += 1;
+    this.state.turnUntil = 0;
+    this.state.turnBudgetSeconds = 0;
+  }
+
+  private countEligible(): number {
+    let n = 0;
+    this.state.seats.forEach((seat) => {
+      if (seat.finishPlace === 0 && !seat.timeExpired) {
+        n += 1;
+      }
+    });
+    return n;
+  }
+
+  /**
+   * Schedule / clear turn deadline for current eligible seat in playing.
+   * Solo budget is preserved across that seat's own moves; becoming solo
+   * mid-turn (or any multi assign) gets a fresh budget.
+   */
+  resyncTurnDeadline(opts?: { preserveSoloBudget?: boolean }) {
+    if (this.state.phase !== "playing") {
+      this.clearTurnDeadline();
+      return;
+    }
+
+    const current = this.state.currentTurnSessionId;
+    if (!this.isEligibleForTurn(current)) {
+      this.clearTurnDeadline();
+      return;
+    }
+
+    const eligible = this.countEligible();
+    if (eligible === 0) {
+      this.clearTurnDeadline();
+      return;
+    }
+
+    if (eligible === 1) {
+      if (
+        opts?.preserveSoloBudget &&
+        this.state.turnBudgetSeconds === SOLO_BUDGET_SECONDS &&
+        this.state.turnUntil > Date.now()
+      ) {
+        return;
+      }
+      this.startTurnDeadline(SOLO_BUDGET_SECONDS);
+      return;
+    }
+
+    this.startTurnDeadline(TURN_BUDGET_SECONDS);
+  }
+
+  private startTurnDeadline(budgetSeconds: number) {
+    const gen = ++this.turnTimerGeneration;
+    this.state.turnBudgetSeconds = budgetSeconds;
+    this.state.turnUntil = Date.now() + budgetSeconds * 1000;
+    this.clock.setTimeout(() => {
+      if (gen !== this.turnTimerGeneration) {
+        return;
+      }
+      this.onTurnTimeout();
+    }, budgetSeconds * 1000);
+  }
+
+  private onTurnTimeout() {
+    if (this.state.phase !== "playing") {
+      this.clearTurnDeadline();
+      return;
+    }
+
+    const eligible = this.countEligible();
+    if (eligible >= 2) {
+      // Pass without moving a piece; fresh deadline for next seat.
+      this.advanceTurn({ preserveSoloBudget: false });
+      return;
+    }
+
+    if (eligible === 1) {
+      const seat = this.state.seats.get(this.state.currentTurnSessionId);
+      if (seat && seat.finishPlace === 0 && !seat.timeExpired) {
+        seat.timeExpired = true;
+      }
+      this.clearTurnDeadline();
+      // No eligible movers remain after expiry.
+      this.state.currentTurnSessionId = this.findEligibleFrom(0);
+      return;
+    }
+
+    this.clearTurnDeadline();
   }
 
   private appendTurn(sessionId: string) {
@@ -266,6 +423,10 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
     // already-eligible current player (SC-MOVE-19 / SC-FINISH-07).
     if (!this.isEligibleForTurn(this.state.currentTurnSessionId)) {
       this.state.currentTurnSessionId = this.findEligibleFrom(0);
+    }
+    if (this.state.phase === "playing") {
+      // Mid-join may flip solo→multi; always resync (no solo preserve).
+      this.resyncTurnDeadline({ preserveSoloBudget: false });
     }
   }
 
@@ -279,22 +440,27 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
 
     if (this.turnOrder.length === 0) {
       this.state.currentTurnSessionId = "";
+      this.clearTurnDeadline();
       return;
     }
 
     if (wasCurrent) {
-      // Next at the same index (wrap), skipping finished seats.
+      // Next at the same index (wrap), skipping finished / time-expired seats.
       this.state.currentTurnSessionId = this.findEligibleFrom(idx);
+    }
+    if (this.state.phase === "playing") {
+      // Leave may create solo mid-turn → fresh 5:00 (do not preserve).
+      this.resyncTurnDeadline({ preserveSoloBudget: false });
     }
   }
 
-  /** Seat may hold turn only while finishPlace === 0. */
+  /** Seat may hold turn only while finishPlace === 0 and not time-expired. */
   private isEligibleForTurn(sessionId: string): boolean {
     const seat = this.state.seats.get(sessionId);
-    return !!seat && seat.finishPlace === 0;
+    return !!seat && seat.finishPlace === 0 && !seat.timeExpired;
   }
 
-  /** Next eligible sessionId starting at `startIdx` (wrap); `""` if all finished. */
+  /** Next eligible sessionId starting at `startIdx` (wrap); `""` if none. */
   private findEligibleFrom(startIdx: number): string {
     if (this.turnOrder.length === 0) {
       return "";
@@ -310,15 +476,24 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
     return "";
   }
 
-  private advanceTurn() {
+  private advanceTurn(opts?: { preserveSoloBudget?: boolean }) {
     if (this.turnOrder.length === 0) {
       this.state.currentTurnSessionId = "";
+      this.clearTurnDeadline();
       return;
     }
     const current = this.state.currentTurnSessionId;
     const idx = this.turnOrder.indexOf(current);
     const from = idx >= 0 ? idx : -1;
     this.state.currentTurnSessionId = this.findEligibleFrom(from + 1);
+
+    const eligible = this.countEligible();
+    const preserve =
+      opts?.preserveSoloBudget ??
+      (eligible === 1 &&
+        this.state.turnBudgetSeconds === SOLO_BUDGET_SECONDS &&
+        this.state.turnUntil > Date.now());
+    this.resyncTurnDeadline({ preserveSoloBudget: preserve });
   }
 
   private listAllPieces(): PieceSnapshot[] {
@@ -384,6 +559,9 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
     if (seat.finishPlace > 0) {
       return; // finished seat — no moves (SC-MOVE-23)
     }
+    if (seat.timeExpired) {
+      return; // solo budget expired — no moves (SC-MOVE-31)
+    }
     if (this.state.currentTurnSessionId !== client.sessionId) {
       return; // out of turn
     }
@@ -422,6 +600,7 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
       }
     }
 
+    // Solo wrap preserves remaining 5:00; multi / becoming-solo gets fresh budget.
     this.advanceTurn();
   }
 
@@ -555,6 +734,7 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
     this.state.countdownRemaining = COUNTDOWN_SECONDS;
     // Legacy `started` mirrors playing only (D1); moves gate on phase === 'playing'.
     this.state.started = false;
+    this.clearTurnDeadline();
     this.refreshMetadata();
 
     const gen = ++this.countdownGeneration;
@@ -576,10 +756,7 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
         return;
       }
 
-      this.state.countdownRemaining = 0;
-      this.state.phase = "playing";
-      this.state.started = true;
-      this.refreshMetadata();
+      this.enterPlaying();
     }, 1000);
   }
 }
